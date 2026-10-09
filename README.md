@@ -35,7 +35,7 @@ their face inside the oval.
 3. Under **Build and deployment → Source**, choose **Deploy from a branch**.
 4. Under **Branch**, pick the branch that holds this app
    (`main`, or `claude/bells-palsy-vr-app-9o6f2t`), folder **/ (root)**, then **Save**.
-5. Wait 1–2 minutes and refresh. GitHub shows the address, for example
+5. Wait 1–2 minutes and refresh. GitHub shows the address:
    `https://axisavalon33-ai.github.io/Facial-palsy-/`.
 
 The repository must be **public** for free GitHub Pages.
