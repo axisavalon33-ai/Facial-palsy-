@@ -11,22 +11,34 @@ A new photo is taken for every symptom.
 | --- | --- |
 | Countdown **3 – 2 – 1** | 3 s |
 | Title **Facial Nerve Palsy** | 4 s |
-| 📸 Photo 1 ("look at the camera" 3-2-1, flash) | 3 s |
-| Symptom 1: Drooping eyebrow (your face next to the changed face) | 30 s |
-| 📸 Photo 2 | 3 s |
-| Symptom 2: Eye cannot close fully (watery eye) | 30 s |
-| 📸 Photo 3 | 3 s |
-| Symptom 3: Flattened cheek and smile line | 30 s |
-| 📸 Photo 4 | 3 s |
-| Symptom 4: Drooping mouth corner | 30 s |
-| 📸 Photo 5 | 3 s |
-| Symptom 5: Drooling | 30 s |
-| 📸 Final photo | 3 s |
+| 📸 Photo 1 (see "Taking each photo" below) | about 7 s |
+| Drooping eyebrow (your face above, changed face below) | 10 s |
+| 📸 Photo 2 | about 7 s |
+| Eye cannot close fully (healthy eye closes, affected eye stays open and waters) | 10 s |
+| 📸 Photo 3 | about 7 s |
+| Flattened cheek and smile line | 10 s |
+| 📸 Photo 4 | about 7 s |
+| Drooping mouth corner (mouth twisted to one side) | 10 s |
+| 📸 Photo 5 | about 7 s |
+| Drooling | 10 s |
+| 📸 Final photo | about 7 s |
 | **All symptoms together**: normal face next to the Bell's palsy face | 5 s |
 | **Thank you for the experience** | 15 s, then back to the start screen |
 
-If no face is visible when a photo is due, the app waits until the person puts
-their face inside the oval.
+### Taking each photo
+
+1. The live camera is shown with an oval. The visitor gets 4 seconds to get ready.
+2. The app checks that the face is in the right position:
+   - inside the oval and not too far or too close
+   - head straight and looking at the camera
+   - eyes open and keeping still
+3. If something is wrong, the oval turns red and a message says what to fix
+   (for example "Come a little closer").
+4. When everything is right, the oval turns green and counts 3-2-1, then takes the photo.
+5. Visitors are asked to smile, because the drooping mouth shows best on a smile.
+
+The app is designed for a tablet held **upright (portrait)**, such as a
+Samsung Galaxy Tab S9 FE.
 
 ## How to put it online (one time only)
 
