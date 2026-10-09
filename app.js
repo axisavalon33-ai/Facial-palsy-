@@ -1,6 +1,7 @@
-// Facial Nerve Palsy – live VR experience
-// Tracks the visitor's face with the camera and warps one side of it to show
-// the symptoms of Bell's palsy, one at a time, then all together.
+// Facial Nerve Palsy – tablet experience
+// The front camera takes a photo of the visitor, then one side of the face in
+// that photo is changed to show a symptom of Bell's palsy. A new photo is taken
+// for every symptom. At the end: normal face next to the full Bell's palsy face.
 
 import { FaceLandmarker, FilesetResolver } from "./lib/vision_bundle.mjs";
 
@@ -8,20 +9,17 @@ import { FaceLandmarker, FilesetResolver } from "./lib/vision_bundle.mjs";
 // EASY SETTINGS – change these numbers to change the timing (in seconds)
 // ---------------------------------------------------------------------------
 const CONFIG = {
-  getReadySeconds: 6,      // VR only: time to slide the phone into the headset
-  countdownSeconds: 3,     // the "3 2 1" countdown
+  countdownSeconds: 3,     // the "3 2 1" countdown at the start
   titleSeconds: 4,         // the "Facial Nerve Palsy" title
-  symptomSeconds: 30,      // each single symptom
-  allTogetherSeconds: 30,  // all symptoms at once (live)
-  snapshotSeconds: 5,      // the normal vs. palsy snapshot
-  thanksSeconds: 15,       // thank-you screen, then back to the menu
+  photoCountdownSeconds: 3,// "look at the camera" countdown before each photo
+  symptomSeconds: 30,      // how long each symptom is shown
+  finalSeconds: 5,         // the final normal vs. Bell's palsy snapshot
+  thanksSeconds: 15,       // thank-you screen, then back to the start
 };
 
 // Add ?quick to the web address to preview everything fast (5 s per symptom).
 if (new URLSearchParams(location.search).has("quick")) {
-  CONFIG.getReadySeconds = 2;
   CONFIG.symptomSeconds = 5;
-  CONFIG.allTogetherSeconds = 5;
   CONFIG.thanksSeconds = 5;
 }
 
@@ -37,6 +35,7 @@ const SYMPTOMS = [
   { key: "drool", title: "Drooling",
     text: "The weak lips cannot seal, so saliva escapes from the corner of the mouth." },
 ];
+const ALL = { brow: 1, eye: 1, cheek: 1, mouth: 1, drool: 1 };
 
 // Face-mesh landmark numbers for the person's LEFT and RIGHT side.
 const SIDE = {
@@ -62,24 +61,20 @@ const ctx = canvas.getContext("2d");
 const video = document.getElementById("video");
 const menu = document.getElementById("menu");
 const statusEl = document.getElementById("status");
-const btnVR = document.getElementById("startVR");
-const btnScreen = document.getElementById("startScreen");
+const btnStart = document.getElementById("start");
 
 let faceLandmarker = null;
 let stream = null;
 let running = false;
-let vrMode = true;
-let mirror = false;
 let affected = SIDE.left, healthy = SIDE.right;
 let strength = 1;
-let timeline = [];
-let startTime = 0;
 let wakeLock = null;
 
-let landmarks = null;        // smoothed landmark pixels [{x,y}]
+let liveLandmarks = null;    // smoothed landmarks of the live camera [{x,y}]
 let lastFaceTime = -1e9;
 let lastVideoTime = -1;
-let snapshot = null;         // { normal, palsy } canvases
+let lm = null;               // landmarks currently used for warping
+let photo = null;            // { canvas, landmarks, crop, before }
 
 // ---------------------------------------------------------------------------
 // Load the face tracker
@@ -98,8 +93,8 @@ async function loadTracker() {
       console.warn("GPU not available, using CPU", e);
       faceLandmarker = await FaceLandmarker.createFromOptions(files, opts("CPU"));
     }
-    statusEl.textContent = "Ready. Choose how you want to start.";
-    btnVR.disabled = btnScreen.disabled = false;
+    statusEl.textContent = "Ready. Tap Start.";
+    btnStart.disabled = false;
   } catch (e) {
     console.error(e);
     statusEl.textContent = "Could not load the face tracker. Check the internet connection and reload the page.";
@@ -110,7 +105,7 @@ loadTracker();
 // ---------------------------------------------------------------------------
 // WebGL face warp: moves small soft areas of the picture ("blobs")
 // ---------------------------------------------------------------------------
-const MAX_BLOBS = 48;
+const MAX_BLOBS = 32;
 const glCanvas = document.createElement("canvas");
 const gl = glCanvas.getContext("webgl", { preserveDrawingBuffer: true, premultipliedAlpha: false });
 const frameCanvas = document.createElement("canvas");
@@ -174,16 +169,16 @@ const uB = gl.getUniformLocation(prog, "u_b");
 const blobA = new Float32Array(MAX_BLOBS * 4);
 const blobB = new Float32Array(MAX_BLOBS * 4);
 
-// Draws the current video frame, warped by `blobs`, into frameCanvas.
-function renderWarp(blobs) {
-  const w = video.videoWidth, h = video.videoHeight;
+// Draws `source` (the photo), warped by `blobs`, into frameCanvas.
+function renderWarp(source, blobs) {
+  const w = source.width, h = source.height;
   if (glCanvas.width !== w || glCanvas.height !== h) {
     glCanvas.width = frameCanvas.width = w;
     glCanvas.height = frameCanvas.height = h;
   }
   gl.viewport(0, 0, w, h);
   gl.bindTexture(gl.TEXTURE_2D, tex);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
   const n = Math.min(blobs.length, MAX_BLOBS);
   blobA.fill(0); blobB.fill(0);
   for (let i = 0; i < n; i++) {
@@ -200,30 +195,27 @@ function renderWarp(blobs) {
 }
 
 // ---------------------------------------------------------------------------
-// Face geometry helpers
+// Face geometry helpers (use the landmarks in `lm`)
 // ---------------------------------------------------------------------------
-const P = (i) => landmarks[i];
+const P = (i) => lm[i];
 
 function faceFrame() {
   const top = P(10), chin = P(152);
-  let dx = chin.x - top.x, dy = chin.y - top.y;
+  const dx = chin.x - top.x, dy = chin.y - top.y;
   const len = Math.hypot(dx, dy) || 1;
   const down = { x: dx / len, y: dy / len };
   const a = P(affected.eyeOuter), b = P(healthy.eyeOuter);
   const s = Math.hypot(a.x - b.x, a.y - b.y); // face scale: width between outer eye corners
-  let ox = a.x - b.x, oy = a.y - b.y;
-  const ol = Math.hypot(ox, oy) || 1;
-  const out = { x: ox / ol, y: oy / ol }; // points toward the affected side
+  const out = { x: (a.x - b.x) / (s || 1), y: (a.y - b.y) / (s || 1) }; // toward the affected side
   return { down, out, s };
 }
 
 // Builds the list of warp blobs. `w` holds the strength (0..1) of each symptom.
 function buildBlobs(w) {
-  if (!landmarks) return [];
   const { down, out, s } = faceFrame();
   const k = strength;
   const blobs = [];
-  // add a blob at landmark i, radius r, moved `dn` down and `dout` toward affected side (all × face scale)
+  // a soft area at landmark i, radius r, moved `dn` down and `dout` toward the affected side (× face scale)
   const add = (i, r, dn, dout, amount) => {
     if (amount <= 0) return;
     const p = P(i);
@@ -274,7 +266,7 @@ function warpedPoint(i, blobs) {
 }
 
 // ---------------------------------------------------------------------------
-// Tears and drool (drawn on top of the warped video)
+// Tears and drool (drawn on top of the warped photo)
 // ---------------------------------------------------------------------------
 function drawDrop(c, x, y, r, alpha) {
   const g = c.createRadialGradient(x - r * 0.35, y - r * 0.35, r * 0.1, x, y, r * 1.1);
@@ -305,9 +297,8 @@ function drawStream(c, x, y, len, width, alpha) {
   c.fill();
 }
 
-// t = seconds since the effect started; amount = 0..1
+// t = seconds since the effect started
 function drawOverlays(c, w, blobs, t) {
-  if (!landmarks) return;
   const { down, s } = faceFrame();
   const angle = Math.atan2(down.y, down.x) - Math.PI / 2;
 
@@ -343,41 +334,37 @@ function drawOverlays(c, w, blobs, t) {
 }
 
 // ---------------------------------------------------------------------------
-// Timeline of the experience
+// Steps of the experience
 // ---------------------------------------------------------------------------
-function buildTimeline() {
-  const tl = [];
-  if (vrMode && CONFIG.getReadySeconds > 0) tl.push({ type: "getready", dur: CONFIG.getReadySeconds });
-  tl.push({ type: "countdown", dur: CONFIG.countdownSeconds });
-  tl.push({ type: "title", dur: CONFIG.titleSeconds });
-  SYMPTOMS.forEach((sym, i) => tl.push({ type: "symptom", dur: CONFIG.symptomSeconds, index: i }));
-  tl.push({ type: "all", dur: CONFIG.allTogetherSeconds });
-  tl.push({ type: "snapshot", dur: CONFIG.snapshotSeconds });
-  tl.push({ type: "thanks", dur: CONFIG.thanksSeconds });
-  let t = 0;
-  for (const st of tl) { st.start = t; t += st.dur; }
-  return tl;
+function buildSteps() {
+  const steps = [
+    { type: "countdown", dur: CONFIG.countdownSeconds },
+    { type: "title", dur: CONFIG.titleSeconds },
+  ];
+  SYMPTOMS.forEach((sym, i) => {
+    steps.push({ type: "photo", label: `Photo ${i + 1}` });
+    steps.push({ type: "symptom", dur: CONFIG.symptomSeconds, index: i });
+  });
+  steps.push({ type: "photo", label: "Final photo" });
+  steps.push({ type: "final", dur: CONFIG.finalSeconds });
+  steps.push({ type: "thanks", dur: CONFIG.thanksSeconds });
+  return steps;
 }
 
-function stageAt(t) {
-  for (const st of timeline) if (t < st.start + st.dur) return st;
-  return null;
+let steps = [];
+let stepIndex = 0;
+let stepStart = 0;
+
+function nextStep(now) {
+  stepIndex++;
+  stepStart = now;
+  if (stepIndex >= steps.length) stopExperience();
 }
 
 const ease = (x) => { x = Math.max(0, Math.min(1, x)); return x * x * (3 - 2 * x); };
 
-function weightsFor(stage, local) {
-  const w = { brow: 0, eye: 0, cheek: 0, mouth: 0, drool: 0 };
-  if (stage.type === "symptom") {
-    w[SYMPTOMS[stage.index].key] = ease(local / 2) * ease((stage.dur - local) / 0.8);
-  } else if (stage.type === "all") {
-    for (const k in w) w[k] = ease(local / 2);
-  }
-  return w;
-}
-
 // ---------------------------------------------------------------------------
-// Face tracking every frame
+// Live face tracking
 // ---------------------------------------------------------------------------
 function track(now) {
   if (!faceLandmarker || video.readyState < 2 || video.currentTime === lastVideoTime) return;
@@ -386,53 +373,69 @@ function track(now) {
   const face = res.faceLandmarks && res.faceLandmarks[0];
   if (!face) return;
   const vw = video.videoWidth, vh = video.videoHeight;
-  if (!landmarks || now - lastFaceTime > 500) {
-    landmarks = face.map((p) => ({ x: p.x * vw, y: p.y * vh }));
+  if (!liveLandmarks || now - lastFaceTime > 500) {
+    liveLandmarks = face.map((p) => ({ x: p.x * vw, y: p.y * vh }));
   } else {
-    const a = 0.55; // smoothing: lower = smoother but slower
+    const a = 0.6; // smoothing
     for (let i = 0; i < face.length; i++) {
-      landmarks[i].x += (face[i].x * vw - landmarks[i].x) * a;
-      landmarks[i].y += (face[i].y * vh - landmarks[i].y) * a;
+      liveLandmarks[i].x += (face[i].x * vw - liveLandmarks[i].x) * a;
+      liveLandmarks[i].y += (face[i].y * vh - liveLandmarks[i].y) * a;
     }
   }
   lastFaceTime = now;
 }
 
-const faceVisible = (now) => landmarks && now - lastFaceTime < 600;
+const faceVisible = (now) => liveLandmarks && now - lastFaceTime < 400;
 
 // ---------------------------------------------------------------------------
-// Drawing helpers for the screen (one view, or two side-by-side views for VR)
+// Taking a photo
 // ---------------------------------------------------------------------------
-function forEachEye(fn) {
-  const W = canvas.width, H = canvas.height;
-  if (vrMode) {
-    const gap = Math.round(W * 0.01);
-    const ew = (W - gap) / 2;
-    eye(0, 0, ew, H, fn);
-    eye(ew + gap, 0, ew, H, fn);
-  } else {
-    eye(0, 0, W, H, fn);
+function takePhoto() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const c = document.createElement("canvas");
+  c.width = vw; c.height = vh;
+  c.getContext("2d").drawImage(video, 0, 0, vw, vh);
+  const landmarks = liveLandmarks.map((p) => ({ x: p.x, y: p.y }));
+
+  // crop around the face (portrait shape)
+  let minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
+  for (const p of landmarks) {
+    minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
+    minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y);
   }
+  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+  let ch = (maxY - minY) * 1.5, cw = ch * 0.8;
+  cw = Math.max(cw, (maxX - minX) * 1.35); ch = cw / 0.8;
+  cw = Math.min(cw, vw); ch = Math.min(ch, vh);
+  const crop = {
+    x: Math.max(0, Math.min(vw - cw, cx - cw / 2)),
+    y: Math.max(0, Math.min(vh - ch, cy - ch / 2)),
+    w: cw, h: ch,
+  };
+  photo = { canvas: c, landmarks, crop };
 }
 
-function eye(x, y, w, h, fn) {
+// Draws the cropped face from `src` into the box, mirrored like a selfie
+function drawFace(src, crop, x, y, w, h) {
   ctx.save();
-  ctx.beginPath();
-  ctx.rect(x, y, w, h);
-  ctx.clip();
-  ctx.translate(x, y);
-  fn(w, h);
+  ctx.translate(x + w, y);
+  ctx.scale(-1, 1);
+  ctx.drawImage(src, crop.x, crop.y, crop.w, crop.h, 0, 0, w, h);
   ctx.restore();
 }
 
-function drawCover(img, iw, ih, w, h, flip) {
-  const sc = Math.max(w / iw, h / ih);
-  const dw = iw * sc, dh = ih * sc;
-  ctx.save();
-  if (flip) { ctx.translate(w, 0); ctx.scale(-1, 1); }
-  ctx.drawImage(img, (w - dw) / 2, (h - dh) / 2, dw, dh);
-  ctx.restore();
+// Renders the photo with the given symptom weights into frameCanvas
+function renderPhoto(w, t) {
+  lm = photo.landmarks;
+  const blobs = buildBlobs(w);
+  renderWarp(photo.canvas, blobs);
+  drawOverlays(frameCtx, w, blobs, t);
 }
+
+// ---------------------------------------------------------------------------
+// Drawing helpers
+// ---------------------------------------------------------------------------
+const FONT = `system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
 
 function background(w, h) {
   const g = ctx.createRadialGradient(w / 2, h * 0.4, 0, w / 2, h / 2, Math.max(w, h) * 0.7);
@@ -445,7 +448,7 @@ function background(w, h) {
 function text(str, x, y, size, color = "#fff", weight = 700, alpha = 1) {
   ctx.globalAlpha = alpha;
   ctx.fillStyle = color;
-  ctx.font = `${weight} ${size}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
+  ctx.font = `${weight} ${size}px ${FONT}`;
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   ctx.fillText(str, x, y);
@@ -453,7 +456,7 @@ function text(str, x, y, size, color = "#fff", weight = 700, alpha = 1) {
 }
 
 function wrapLines(str, maxW, size, weight) {
-  ctx.font = `${weight} ${size}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
+  ctx.font = `${weight} ${size}px ${FONT}`;
   const words = str.split(" ");
   const lines = [];
   let line = "";
@@ -475,13 +478,47 @@ function roundRect(x, y, w, h, r) {
   ctx.closePath();
 }
 
+// Two face pictures side by side (landscape) or on top of each other (portrait).
+// Returns the area left over below for the caption.
+function drawPair(w, h, top, bottom, labelA, labelB, drawA, drawB) {
+  const u = Math.min(w, h);
+  const labelH = u * 0.07;
+  const areaH = bottom - top;
+  const landscape = w >= h * 0.9;
+  const aspect = photo.crop.w / photo.crop.h;
+  let pw, ph, x1, y1, x2, y2;
+  if (landscape) {
+    const gap = w * 0.04;
+    ph = areaH - labelH;
+    pw = ph * aspect;
+    if (pw * 2 + gap > w * 0.92) { pw = (w * 0.92 - gap) / 2; ph = pw / aspect; }
+    x1 = w / 2 - gap / 2 - pw; x2 = w / 2 + gap / 2;
+    y1 = y2 = top + (areaH - labelH - ph) / 2;
+  } else {
+    const gap = h * 0.02;
+    ph = (areaH - gap - labelH * 2) / 2;
+    pw = ph * aspect;
+    if (pw > w * 0.9) { pw = w * 0.9; ph = pw / aspect; }
+    x1 = x2 = (w - pw) / 2;
+    y1 = top; y2 = top + ph + labelH + gap;
+  }
+  drawA(x1, y1, pw, ph);
+  drawB(x2, y2, pw, ph);
+  ctx.strokeStyle = "rgba(255,255,255,0.6)";
+  ctx.lineWidth = Math.max(2, u * 0.004);
+  ctx.strokeRect(x1, y1, pw, ph);
+  ctx.strokeRect(x2, y2, pw, ph);
+  text(labelA, x1 + pw / 2, y1 + ph + labelH * 0.5, u * 0.04, "#fff", 700);
+  text(labelB, x2 + pw / 2, y2 + ph + labelH * 0.5, u * 0.04, "#ffd479", 700);
+}
+
 function caption(w, h, label, title, body, progress) {
   const u = Math.min(w, h);
-  const boxW = Math.min(w * 0.82, u * 1.4);
+  const boxW = Math.min(w * 0.9, u * 1.5);
   const titleSize = u * 0.05, bodySize = u * 0.03, labelSize = u * 0.026;
   const lines = wrapLines(body, boxW * 0.9, bodySize, 400);
   const boxH = labelSize * 1.6 + titleSize * 1.4 + lines.length * bodySize * 1.35 + u * 0.05;
-  const bx = (w - boxW) / 2, by = h * 0.97 - boxH;
+  const bx = (w - boxW) / 2, by = h * 0.98 - boxH;
   ctx.fillStyle = "rgba(0,0,0,0.6)";
   roundRect(bx, by, boxW, boxH, u * 0.025);
   ctx.fill();
@@ -491,79 +528,11 @@ function caption(w, h, label, title, body, progress) {
   text(title, w / 2, y, titleSize, "#ffd479", 800);
   y += titleSize * 0.65 + bodySize * 0.8;
   for (const ln of lines) { text(ln, w / 2, y, bodySize, "#fff", 400); y += bodySize * 1.35; }
-  // progress bar
   ctx.fillStyle = "rgba(255,255,255,0.2)";
   ctx.fillRect(bx + u * 0.02, by + boxH - u * 0.015, boxW - u * 0.04, u * 0.006);
   ctx.fillStyle = "#ffd479";
-  ctx.fillRect(bx + u * 0.02, by + boxH - u * 0.015, (boxW - u * 0.04) * progress, u * 0.006);
-}
-
-// ---------------------------------------------------------------------------
-// Snapshot: same moment, normal face vs. Bell's palsy face
-// ---------------------------------------------------------------------------
-function takeSnapshot() {
-  if (!landmarks || video.readyState < 2) { snapshot = null; return; }
-  // crop around the face
-  let minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
-  for (const p of landmarks) {
-    minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
-    minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y);
-  }
-  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
-  let ch = (maxY - minY) * 1.45, cw = ch * 0.78;
-  cw = Math.max(cw, (maxX - minX) * 1.3); ch = cw / 0.78;
-  const vw = video.videoWidth, vh = video.videoHeight;
-  cw = Math.min(cw, vw); ch = Math.min(ch, vh);
-  const crop = {
-    x: Math.max(0, Math.min(vw - cw, cx - cw / 2)),
-    y: Math.max(0, Math.min(vh - ch, cy - ch / 2)),
-    w: cw, h: ch,
-  };
-
-  const make = (blobs, w) => {
-    renderWarp(blobs);
-    if (w) drawOverlays(frameCtx, w, blobs, 2.2);
-    const c = document.createElement("canvas");
-    c.width = Math.round(crop.w); c.height = Math.round(crop.h);
-    const cc = c.getContext("2d");
-    cc.fillStyle = "#000"; cc.fillRect(0, 0, c.width, c.height);
-    if (mirror) { cc.translate(c.width, 0); cc.scale(-1, 1); }
-    cc.drawImage(frameCanvas, crop.x, crop.y, crop.w, crop.h, 0, 0, c.width, c.height);
-    return c;
-  };
-  const all = { brow: 1, eye: 1, cheek: 1, mouth: 1, drool: 1 };
-  const normal = make([], null);
-  const palsy = make(buildBlobs(all), all);
-  snapshot = { normal, palsy };
-}
-
-function drawSnapshot(w, h, local) {
-  background(w, h);
-  const u = Math.min(w, h);
-  text("Snapshot", w / 2, h * 0.1, u * 0.05, "#9fc3ff", 600);
-  if (!snapshot) {
-    text("No face was found for the snapshot", w / 2, h / 2, u * 0.05);
-    return;
-  }
-  const fade = ease(local / 0.5);
-  const gap = w * 0.04;
-  const imgH = h * 0.66;
-  let imgW = imgH * (snapshot.normal.width / snapshot.normal.height);
-  if (imgW * 2 + gap > w * 0.94) { imgW = (w * 0.94 - gap) / 2; }
-  const ih = imgW * (snapshot.normal.height / snapshot.normal.width);
-  const y = h * 0.17;
-  const x1 = w / 2 - gap / 2 - imgW, x2 = w / 2 + gap / 2;
-  ctx.globalAlpha = fade;
-  ctx.drawImage(snapshot.normal, x1, y, imgW, ih);
-  ctx.drawImage(snapshot.palsy, x2, y, imgW, ih);
-  ctx.globalAlpha = 1;
-  ctx.strokeStyle = "rgba(255,255,255,0.6)";
-  ctx.lineWidth = Math.max(2, u * 0.004);
-  ctx.strokeRect(x1, y, imgW, ih);
-  ctx.strokeRect(x2, y, imgW, ih);
-  const ly = y + ih + u * 0.06;
-  text("Normal face", x1 + imgW / 2, ly, u * 0.045, "#fff", 700, fade);
-  text("Bell's palsy face", x2 + imgW / 2, ly, u * 0.045, "#ffd479", 700, fade);
+  ctx.fillRect(bx + u * 0.02, by + boxH - u * 0.015, (boxW - u * 0.04) * Math.min(1, progress), u * 0.006);
+  return by;
 }
 
 // ---------------------------------------------------------------------------
@@ -577,106 +546,118 @@ function resize() {
 window.addEventListener("resize", resize);
 resize();
 
-let lastStage = null;
-
 function loop(now) {
   if (!running) return;
   requestAnimationFrame(loop);
   track(now);
 
-  const t = (now - startTime) / 1000;
-  const stage = stageAt(t);
-  if (!stage) { stopExperience(); return; }
-  const local = t - stage.start;
-  if (stage !== lastStage) {
-    if (stage.type === "snapshot") takeSnapshot();
-    lastStage = stage;
-  }
+  const step = steps[stepIndex];
+  const local = (now - stepStart) / 1000;
+  if (step.dur !== undefined && local >= step.dur) { nextStep(now); return; }
 
+  const w = canvas.width, h = canvas.height, u = Math.min(w, h);
   ctx.fillStyle = "#000";
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillRect(0, 0, w, h);
 
-  if (stage.type === "symptom" || stage.type === "all") {
-    const hasFace = faceVisible(now);
-    const w = weightsFor(stage, local);
-    const blobs = hasFace ? buildBlobs(w) : [];
-    if (video.readyState >= 2) {
-      renderWarp(blobs);
-      if (hasFace) drawOverlays(frameCtx, w, blobs, local);
-    }
-    const n = SYMPTOMS.length;
-    forEachEye((ew, eh) => {
-      if (video.readyState >= 2) drawCover(frameCanvas, frameCanvas.width, frameCanvas.height, ew, eh, mirror);
-      const u = Math.min(ew, eh);
-      if (stage.type === "symptom") {
-        const s = SYMPTOMS[stage.index];
-        caption(ew, eh, `Symptom ${stage.index + 1} of ${n}`, s.title, s.text, local / stage.dur);
-      } else {
-        caption(ew, eh, "Bell's palsy", "All symptoms together",
-          "Bell's palsy is a sudden weakness of one side of the face caused by inflammation of the facial nerve (cranial nerve VII).",
-          local / stage.dur);
-      }
-      if (!hasFace) {
-        ctx.fillStyle = "rgba(0,0,0,0.55)";
-        roundRect(ew * 0.2, eh * 0.08, ew * 0.6, u * 0.1, u * 0.02);
-        ctx.fill();
-        text(vrMode ? "Looking for a face… look at a mirror or a person" : "Looking for a face… look at the camera",
-             ew / 2, eh * 0.08 + u * 0.05, u * 0.035, "#ffd479", 600);
-      }
-    });
-    return;
+  if (step.type === "countdown") {
+    background(w, h);
+    const n = Math.max(1, Math.ceil(step.dur - local));
+    const f = local % 1;
+    text(String(n), w / 2, h / 2, u * 0.35 * (1 + (1 - f) * 0.3), "#fff", 800, 1 - f * 0.6);
+  } else if (step.type === "title") {
+    background(w, h);
+    const a = ease(local / 0.8) * ease((step.dur - local) / 0.6);
+    text("Facial Nerve Palsy", w / 2, h * 0.45, u * 0.1, "#fff", 800, a);
+    text("Bell's palsy", w / 2, h * 0.57, u * 0.05, "#ffd479", 500, a);
+  } else if (step.type === "photo") {
+    drawPhotoStep(now, local, step, w, h, u);
+  } else if (step.type === "symptom") {
+    const sym = SYMPTOMS[step.index];
+    const weights = { brow: 0, eye: 0, cheek: 0, mouth: 0, drool: 0 };
+    weights[sym.key] = ease((local - 0.8) / 2); // the change appears smoothly
+    renderPhoto(weights, local);
+    background(w, h);
+    const capTop = caption(w, h, `Symptom ${step.index + 1} of ${SYMPTOMS.length}`, sym.title, sym.text, local / step.dur);
+    drawPair(w, h, h * 0.03, capTop - u * 0.02, "Your face", sym.title,
+      (x, y, pw, ph) => drawFace(photo.canvas, photo.crop, x, y, pw, ph),
+      (x, y, pw, ph) => drawFace(frameCanvas, photo.crop, x, y, pw, ph));
+    flash(local, w, h);
+  } else if (step.type === "final") {
+    renderPhoto(ALL, local + 2);
+    background(w, h);
+    text("All symptoms together", w / 2, h * 0.06, u * 0.05, "#9fc3ff", 700);
+    drawPair(w, h, h * 0.12, h * 0.97, "Normal face", "Bell's palsy face",
+      (x, y, pw, ph) => drawFace(photo.canvas, photo.crop, x, y, pw, ph),
+      (x, y, pw, ph) => drawFace(frameCanvas, photo.crop, x, y, pw, ph));
+    flash(local, w, h);
+  } else if (step.type === "thanks") {
+    background(w, h);
+    const a = ease(local);
+    text("Thank you", w / 2, h * 0.43, u * 0.11, "#fff", 800, a);
+    text("for the experience", w / 2, h * 0.56, u * 0.06, "#ffd479", 500, a);
   }
+}
 
-  forEachEye((ew, eh) => {
-    const u = Math.min(ew, eh);
-    if (stage.type === "getready") {
-      background(ew, eh);
-      text("Put the phone in the headset", ew / 2, eh * 0.42, u * 0.06);
-      text(`Starting in ${Math.ceil(stage.dur - local)}…`, ew / 2, eh * 0.56, u * 0.045, "#9fc3ff", 500);
-    } else if (stage.type === "countdown") {
-      background(ew, eh);
-      const n = Math.max(1, Math.ceil(stage.dur - local));
-      const f = local % 1;
-      const scale = 1 + (1 - f) * 0.35;
-      text(String(n), ew / 2, eh / 2, u * 0.32 * scale, "#ffffff", 800, 1 - f * 0.6);
-    } else if (stage.type === "title") {
-      background(ew, eh);
-      const a = ease(local / 0.8) * ease((stage.dur - local) / 0.6);
-      text("Facial Nerve Palsy", ew / 2, eh * 0.45, u * 0.1, "#ffffff", 800, a);
-      text("Bell's palsy", ew / 2, eh * 0.58, u * 0.05, "#ffd479", 500, a);
-    } else if (stage.type === "snapshot") {
-      drawSnapshot(ew, eh, local);
-    } else if (stage.type === "thanks") {
-      background(ew, eh);
-      const a = ease(local / 1);
-      text("Thank you", ew / 2, eh * 0.42, u * 0.11, "#ffffff", 800, a);
-      text("for the experience", ew / 2, eh * 0.56, u * 0.06, "#ffd479", 500, a);
-    }
-  });
+// White camera flash right after a photo
+function flash(local, w, h) {
+  if (local > 0.5) return;
+  ctx.fillStyle = `rgba(255,255,255,${1 - local / 0.5})`;
+  ctx.fillRect(0, 0, w, h);
+}
+
+// Live camera with a countdown; the photo is taken when a face is visible
+function drawPhotoStep(now, local, step, w, h, u) {
+  if (video.readyState >= 2) {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    const sc = Math.max(w / vw, h / vh);
+    ctx.save();
+    ctx.translate(w, 0);
+    ctx.scale(-1, 1); // mirror, like a selfie
+    ctx.drawImage(video, (w - vw * sc) / 2, (h - vh * sc) / 2, vw * sc, vh * sc);
+    ctx.restore();
+  }
+  // face guide oval
+  ctx.strokeStyle = "rgba(255,255,255,0.7)";
+  ctx.lineWidth = u * 0.006;
+  ctx.setLineDash([u * 0.02, u * 0.015]);
+  ctx.beginPath();
+  ctx.ellipse(w / 2, h * 0.5, u * 0.3, u * 0.4, 0, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  ctx.fillStyle = "rgba(0,0,0,0.55)";
+  roundRect(w / 2 - u * 0.45, h * 0.02, u * 0.9, u * 0.12, u * 0.02);
+  ctx.fill();
+  text(step.label, w / 2, h * 0.02 + u * 0.035, u * 0.03, "#9fc3ff", 600);
+  const hasFace = faceVisible(now);
+  text(hasFace ? "Look at the camera and keep still" : "Put your face inside the oval",
+       w / 2, h * 0.02 + u * 0.08, u * 0.04, "#fff", 700);
+
+  const left = CONFIG.photoCountdownSeconds - local;
+  if (left > 0) {
+    text(String(Math.ceil(left)), w / 2, h * 0.88, u * 0.14, "#ffd479", 800, 0.9);
+  } else if (hasFace) {
+    takePhoto();
+    nextStep(now);
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Start / stop
 // ---------------------------------------------------------------------------
-async function startExperience(isVR) {
-  vrMode = isVR;
-  const camChoice = document.getElementById("camera").value;
-  const facing = camChoice === "auto" ? (isVR ? "environment" : "user") : camChoice;
-  mirror = facing === "user";
+async function startExperience() {
   affected = SIDE[document.getElementById("side").value];
   healthy = affected === SIDE.left ? SIDE.right : SIDE.left;
   strength = parseFloat(document.getElementById("strength").value);
 
-  // Full screen + landscape for the headset (ignored where not supported)
   try { await document.documentElement.requestFullscreen?.(); } catch (e) {}
-  if (isVR) { try { await screen.orientation?.lock?.("landscape"); } catch (e) {} }
   try { wakeLock = await navigator.wakeLock?.request("screen"); } catch (e) {}
 
   statusEl.textContent = "Starting camera…";
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       audio: false,
-      video: { facingMode: { ideal: facing }, width: { ideal: 1280 }, height: { ideal: 720 } },
+      video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
     });
   } catch (e) {
     console.error(e);
@@ -686,12 +667,13 @@ async function startExperience(isVR) {
   video.srcObject = stream;
   try { await video.play(); } catch (e) {}
 
-  landmarks = null; snapshot = null; lastStage = null;
-  timeline = buildTimeline();
+  liveLandmarks = null; photo = null;
+  steps = buildSteps();
+  stepIndex = 0;
   menu.classList.add("hidden");
   running = true;
   resize();
-  startTime = performance.now();
+  stepStart = performance.now();
   requestAnimationFrame(loop);
 }
 
@@ -703,13 +685,12 @@ function stopExperience() {
   ctx.fillStyle = "#000";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   menu.classList.remove("hidden");
-  statusEl.textContent = "Ready for the next visitor.";
+  statusEl.textContent = "Ready for the next visitor. Tap Start.";
 }
 
-btnVR.addEventListener("click", () => startExperience(true));
-btnScreen.addEventListener("click", () => startExperience(false));
+btnStart.addEventListener("click", startExperience);
 
-// Double-tap (or double-click) to go back to the menu
+// Double-tap (or double-click) to go back to the start screen
 let lastTap = 0;
 canvas.addEventListener("pointerdown", () => {
   const now = performance.now();
@@ -718,4 +699,4 @@ canvas.addEventListener("pointerdown", () => {
 });
 
 // Debug hook used for automated testing
-window.__palsy = { CONFIG, startExperience, get stage() { return lastStage && lastStage.type; } };
+window.__palsy = { CONFIG, get step() { return running ? steps[stepIndex].type : "menu"; } };

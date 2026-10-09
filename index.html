@@ -6,7 +6,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="theme-color" content="#000000">
-  <title>Facial Nerve Palsy VR</title>
+  <title>Facial Nerve Palsy</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -18,24 +18,16 @@
   <div id="menu">
     <div class="card">
       <h1>Facial Nerve Palsy</h1>
-      <p class="sub">A live VR experience of Bell's palsy</p>
+      <p class="sub">See how Bell's palsy changes a face</p>
 
       <div class="buttons">
-        <button id="startVR" disabled>Start VR<span>phone in a headset</span></button>
-        <button id="startScreen" disabled>Start on screen<span>laptop / tablet / TV</span></button>
+        <button id="start" disabled>Start<span>stand in front of the tablet</span></button>
       </div>
 
       <p id="status">Loading face tracker…</p>
 
       <details>
         <summary>Settings</summary>
-        <label>Camera
-          <select id="camera">
-            <option value="auto">Automatic (back camera for VR, front for screen)</option>
-            <option value="environment">Back camera</option>
-            <option value="user">Front (selfie) camera</option>
-          </select>
-        </label>
         <label>Side of the face affected
           <select id="side">
             <option value="left">Person's left side</option>

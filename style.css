@@ -76,7 +76,6 @@ button {
 }
 
 button span { font-size: 13px; font-weight: 400; opacity: 0.85; margin-top: 4px; }
-button#startScreen { background: #3a4459; }
 button:disabled { opacity: 0.4; cursor: wait; }
 
 #status { min-height: 1.4em; color: #ffd479; margin: 18px 0; }
