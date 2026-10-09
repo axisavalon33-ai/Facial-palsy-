@@ -1,9 +1,10 @@
-# Facial Nerve Palsy – tablet experience
+# Facial Nerve Palsy – Bell's palsy simulation
 
-An app for a neuroscience exhibition, made to run on a **tablet**. The
-**front camera** takes a photo of the visitor, then one side of their face in
-the photo is changed to show a symptom of **Bell's palsy** (facial nerve palsy).
-A new photo is taken for every symptom.
+A tablet app for a neuroscience exhibition (designed for a Samsung Galaxy Tab
+S9 FE held upright). The front camera shows the visitor's face with one side
+changed to look like **Bell's palsy** (peripheral facial nerve palsy).
+
+*Simulation for education. Not a diagnosis.*
 
 ## What the visitor sees
 
@@ -11,73 +12,61 @@ A new photo is taken for every symptom.
 | --- | --- |
 | Countdown **3 – 2 – 1** | 3 s |
 | Title **Facial Nerve Palsy** | 4 s |
-| 📸 Photo 1 (see "Taking each photo" below) | about 7 s |
-| Drooping eyebrow (your face above, changed face below) | 10 s |
-| 📸 Photo 2 | about 7 s |
-| Eye cannot close fully (healthy eye closes, affected eye stays open and waters) | 10 s |
-| 📸 Photo 3 | about 7 s |
-| Flattened cheek and smile line | 10 s |
-| 📸 Photo 4 | about 7 s |
-| Drooping mouth corner (mouth twisted to one side) | 10 s |
-| 📸 Photo 5 | about 7 s |
-| Drooling | 10 s |
-| 📸 Final photo | about 7 s |
-| **All symptoms together**: normal face next to the Bell's palsy face | 5 s |
-| **Thank you for the experience** | 15 s, then back to the start screen |
+| Live palsy mirror: "Try to smile", "Raise your eyebrows", "Close your eyes tight" | 6 s each |
+| 📸 One photo (face-position check, then 3-2-1) | about 6 s |
+| Drooping eyebrow (on the photo) | 5 s |
+| Eye cannot close fully | 5 s |
+| Flattened cheek and smile line | 5 s |
+| Drooping mouth corner | 5 s |
+| All symptoms together: normal face and Bell's palsy face | 5 s |
+| **Thank you for the experience** | 10 s, then back to the start |
 
-### Taking each photo
+Each symptom fades in on the photo, stays, then fades out before the next one.
 
-1. The live camera is shown with an oval. The visitor gets 4 seconds to get ready.
-2. The app checks that the face is in the right position:
-   - inside the oval and not too far or too close
-   - head straight and looking at the camera
-   - eyes open and keeping still
-3. If something is wrong, the oval turns red and a message says what to fix
-   (for example "Come a little closer").
-4. When everything is right, the oval turns green and counts 3-2-1, then takes the photo.
-5. Visitors are asked to smile, because the drooping mouth shows best on a smile.
+## Controls on the live screen
 
-The app is designed for a tablet held **upright (portrait)**, such as a
-Samsung Galaxy Tab S9 FE.
+- **Left side / Right side**: which side of the face is affected.
+- **Severity**: House-Brackmann grade I (normal) to VI (total paralysis). This scales all movements.
+- **Show original**: switch the effect off and on.
+- **Take photo**: skip the prompts and go straight to the photo.
+- **Double-tap** the picture at any time to return to the start screen.
 
-## How to put it online (one time only)
+## How the simulation works (for the curious)
 
-1. Open this repository on github.com.
-2. Click **Settings** (top bar), then **Pages** (left menu).
-3. Under **Build and deployment → Source**, choose **Deploy from a branch**.
-4. Under **Branch**, pick the branch that holds this app
-   (`main`, or `claude/bells-palsy-vr-app-9o6f2t`), folder **/ (root)**, then **Save**.
-5. Wait 1–2 minutes and refresh. GitHub shows the address:
-   `https://axisavalon33-ai.github.io/Facial-palsy-/`.
+- **Google MediaPipe Face Landmarker** finds 478 points on the face in every frame.
+- The points are joined into triangles (**Delaunay triangulation**). WebGL then
+  draws the camera image through the moved triangles, which is a triangle-mesh warp.
+- Only points on the affected side of the **facial midline** (landmarks
+  10, 168, 6, 1, 152) move. The other side, the hair, the neck and the background
+  stay untouched.
+- Moves use small distances with a soft Gaussian falloff (sigma 30–40 px):
+  - **Brow**: lowered, with forehead wrinkles smoothed.
+  - **Eye**: looks wider, with a slight lower-lid sag and a faint lower-lid shadow.
+    The iris is never stretched.
+  - **Cheek**: mild sag, with the nasolabial fold smoothed.
+  - **Mouth**: the corner is pulled down 8–15 px and slightly outward, and the upper lip on that side is flattened.
+- **Reacts to the visitor's face**:
+  - When the visitor smiles, the affected side moves only 20–40% as much.
+  - When they raise their eyebrows, the affected brow doesn't move.
+  - When they close their eyes, the affected eye stays slightly open.
+- Point jitter is smoothed with an exponential moving average.
 
-The repository must be **public** for free GitHub Pages.
+Each step is explained with comments in `app.js`.
 
-## How to use it at the exhibition
+## Put it online (GitHub Pages)
 
-1. Open the address on the tablet in **Chrome** (Android) or **Safari** (iPad).
-2. Tap **Start** and allow the camera.
-3. The visitor stands or sits in front of the tablet and looks at the screen.
-4. **Double-tap** the screen at any time to go back to the start screen.
+Settings → Pages → *Deploy from a branch* → choose the branch with this app and `/ (root)` → Save.
+The address will look like `https://axisavalon33-ai.github.io/Facial-palsy-/`.
 
-Under **Settings** on the start screen you can choose which side of the face is
-affected and how strong the effect is.
+## Changing timings
 
-Tips: good light on the face, the tablet at face height (a stand helps),
-keep it plugged in.
-
-Add `?quick` to the end of the address to preview everything quickly
-(5 s per symptom).
-
-## Changing the timings
-
-Open `app.js`, find `CONFIG` near the top and change the numbers (seconds).
-On github.com: click the file, then the ✏️ pencil icon, then **Commit changes**.
+Open `app.js` and change the numbers in `CONFIG` at the top. Add `?quick` to
+the address for a fast preview.
 
 ## Files
 
-- `index.html`, `style.css`: the start screen
-- `app.js`: the experience (face tracking, photos, effects, timing)
-- `lib/`: Google MediaPipe face tracker (Apache 2.0 licence)
-- `models/face_landmarker.task`: the face-tracking model
+- `index.html`, `style.css`: the screens and buttons
+- `app.js`: everything else (tracking, mesh warp, timing)
+- `lib/`, `models/`: a backup copy of MediaPipe (Apache 2.0), used only if the CDN can't be reached
 
-Everything runs inside the browser. No photo or video is uploaded or saved anywhere.
+No photos or video leave the tablet.

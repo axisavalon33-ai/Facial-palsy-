@@ -3,45 +3,44 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
-  <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="theme-color" content="#000000">
   <title>Facial Nerve Palsy</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <!-- The experience is drawn on this canvas -->
+  <!-- Everything visual is drawn on this canvas -->
   <canvas id="screen"></canvas>
   <video id="video" playsinline muted autoplay></video>
 
-  <!-- Start menu (hidden while the experience runs) -->
+  <!-- Start screen -->
   <div id="menu">
     <div class="card">
       <h1>Facial Nerve Palsy</h1>
-      <p class="sub">See how Bell's palsy changes a face</p>
-
-      <div class="buttons">
-        <button id="start" disabled>Start<span>stand in front of the tablet</span></button>
-      </div>
-
+      <p class="sub">A Bell's palsy simulation</p>
+      <button id="start" class="primary big" disabled>Start</button>
       <p id="status">Loading face tracker…</p>
-
-      <details>
-        <summary>Settings</summary>
-        <label>Side of the face affected
-          <select id="side">
-            <option value="left">Person's left side</option>
-            <option value="right">Person's right side</option>
-          </select>
-        </label>
-        <label>Effect strength
-          <input id="strength" type="range" min="0.5" max="1.6" step="0.1" value="1">
-        </label>
-      </details>
-
-      <p class="tip">Double-tap the screen at any time to come back to this menu.</p>
     </div>
   </div>
+
+  <!-- Controls shown on the live screen -->
+  <div id="controls" class="hidden">
+    <div class="row">
+      <button id="sideLeft" class="seg">Left side</button>
+      <button id="sideRight" class="seg">Right side</button>
+    </div>
+    <label class="sev">
+      <span>Severity: <b id="sevLabel"></b></span>
+      <input id="severity" type="range" min="1" max="6" step="1" value="5">
+    </label>
+    <div class="row">
+      <button id="original">Show original</button>
+      <button id="photoBtn" class="primary">Take photo</button>
+    </div>
+  </div>
+
+  <div id="caption">Simulation for education. Not a diagnosis.</div>
 
   <script type="module" src="app.js"></script>
 </body>

@@ -1,167 +1,281 @@
-// Facial Nerve Palsy – tablet experience
-// The front camera takes a photo of the visitor, then one side of the face in
-// that photo is changed to show a symptom of Bell's palsy. A new photo is taken
-// for every symptom. At the end: normal face next to the full Bell's palsy face.
-
-import { FaceLandmarker, FilesetResolver } from "./lib/vision_bundle.mjs";
+// Facial Nerve Palsy – Bell's palsy simulation for a tablet (front camera)
+//
+// How it works
+// 1. MediaPipe Face Landmarker finds 478 points on the face (468 face points
+//    + 10 iris points) in every camera frame.
+// 2. The points (plus a ring of fixed points around the face and the image
+//    corners) are joined into triangles with a Delaunay triangulation.
+// 3. Every frame each point gets a small displacement on the affected side of
+//    the face. WebGL then draws the camera image with the moved triangles
+//    (a triangle-mesh warp), so the picture bends smoothly with no edges.
+// 4. Background, hair and neck use points that never move, so they stay as is.
+//
+// Experience: 3-2-1 → title → live palsy mirror with prompts → one photo →
+// each symptom on the photo for 5 s → all symptoms together → thank you.
 
 // ---------------------------------------------------------------------------
-// EASY SETTINGS – change these numbers to change the timing (in seconds)
+// EASY SETTINGS (seconds)
 // ---------------------------------------------------------------------------
 const CONFIG = {
-  countdownSeconds: 3,      // the "3 2 1" countdown at the start
-  titleSeconds: 4,          // the "Facial Nerve Palsy" title
-  photoGetReadySeconds: 4,  // "get ready" time before each photo
-  photoHoldSeconds: 3,      // face must stay in a good position this long (3-2-1) before the photo
-  symptomSeconds: 10,       // how long each changed photo is shown
-  finalSeconds: 5,          // the final normal vs. Bell's palsy snapshot
-  thanksSeconds: 15,        // thank-you screen, then back to the start
+  countdownSeconds: 3,     // "3 2 1"
+  titleSeconds: 4,         // "Facial Nerve Palsy"
+  promptSeconds: 6,        // each live prompt: smile / raise eyebrows / close eyes
+  photoGetReadySeconds: 3, // time to get ready before the photo
+  photoHoldSeconds: 3,     // face must stay in position this long (3-2-1)
+  symptomSeconds: 5,       // each symptom on the photo
+  finalSeconds: 5,         // normal face vs. Bell's palsy face
+  thanksSeconds: 10,       // thank-you screen, then back to the start
+  defaultGrade: 6,         // House-Brackmann grade on start (1-6)
+  defaultSide: "left",     // affected side on start
+  effectScale: 1.0,        // multiply all movements (staff fine-tuning)
 };
+const QUICK = new URLSearchParams(location.search).has("quick");
+if (QUICK) { CONFIG.promptSeconds = 2; CONFIG.photoGetReadySeconds = 1; CONFIG.thanksSeconds = 4; }
 
-const DEBUG = new URLSearchParams(location.search).has("debug");
-
-// Add ?quick to the web address to preview everything fast (5 s per symptom).
-if (new URLSearchParams(location.search).has("quick")) {
-  CONFIG.photoGetReadySeconds = 1;
-  CONFIG.symptomSeconds = 5;
-  CONFIG.thanksSeconds = 5;
-}
+const PROMPTS = ["Try to smile", "Raise your eyebrows", "Close your eyes tight"];
 
 const SYMPTOMS = [
   { key: "brow",  title: "Drooping eyebrow" },
   { key: "eye",   title: "Eye cannot close fully" },
   { key: "cheek", title: "Flattened cheek and smile line" },
   { key: "mouth", title: "Drooping mouth corner" },
-  { key: "drool", title: "Drooling" },
 ];
-const NONE = { brow: 0, eye: 0, cheek: 0, mouth: 0, drool: 0, close: 0 };
-const ALL = { brow: 1, eye: 1, cheek: 1, mouth: 1, drool: 1, close: 0 };
+const ALL = { brow: 1, eye: 1, cheek: 1, mouth: 1 };
 
-// Face-mesh landmark numbers for the person's LEFT and RIGHT side.
+// House-Brackmann grades: name and how strong the simulation is (0..1)
+const GRADES = [
+  null,
+  { name: "I – Normal", k: 0 },
+  { name: "II – Mild dysfunction", k: 0.25 },
+  { name: "III – Moderate dysfunction", k: 0.45 },
+  { name: "IV – Moderately severe dysfunction", k: 0.65 },
+  { name: "V – Severe dysfunction", k: 0.85 },
+  { name: "VI – Total paralysis", k: 1 },
+];
+
+// ---------------------------------------------------------------------------
+// Landmark numbers (MediaPipe face mesh). "left" = the person's own left.
+// ---------------------------------------------------------------------------
+const MIDLINE = [10, 168, 6, 1, 152]; // forehead → nose bridge → nose tip → chin
+const FACE_OVAL = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378,
+  400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109];
+const ANCHORS = [168, 6, 197, 195, 133, 362]; // points that barely move with expressions
+
 const SIDE = {
   left: {
-    brow: [300, 334], forehead: 299, upperLid: 386, lowerLid: 374,
-    lowerLidOuter: 373, lowerLidInner: 380, eyeOuter: 263,
-    mouthCorner: 291, lowerLip: 321, upperLip: 270,
-    cheek: 280, fold: 425, noseWing: 358,
+    browInner: 336, browMid: 334, browOuter: 300, forehead: 299,
+    upperLid: 386, lowerLid: 374, lowerLidOuter: 373, lowerLidInner: 380,
+    eyeInner: 362, eyeOuter: 263,
+    upper: [466, 388, 387, 386, 385, 384, 398], lower: [382, 381, 380, 374, 373, 390, 249],
+    iris: [473, 474, 475, 476, 477],
+    fold: 425, cheek: 280, noseWing: 358,
+    mouthCorner: 291, upperLip: [269, 270], lowerLip: 321,
   },
   right: {
-    brow: [70, 105], forehead: 69, upperLid: 159, lowerLid: 145,
-    lowerLidOuter: 144, lowerLidInner: 153, eyeOuter: 33,
-    mouthCorner: 61, lowerLip: 91, upperLip: 40,
-    cheek: 50, fold: 205, noseWing: 129,
+    browInner: 107, browMid: 105, browOuter: 70, forehead: 69,
+    upperLid: 159, lowerLid: 145, lowerLidOuter: 144, lowerLidInner: 153,
+    eyeInner: 133, eyeOuter: 33,
+    upper: [246, 161, 160, 159, 158, 157, 173], lower: [7, 163, 144, 145, 153, 154, 155],
+    iris: [468, 469, 470, 471, 472],
+    fold: 205, cheek: 50, noseWing: 129,
+    mouthCorner: 61, upperLip: [39, 40], lowerLip: 91,
   },
 };
 
 // ---------------------------------------------------------------------------
-// Page elements
+// State
 // ---------------------------------------------------------------------------
-const canvas = document.getElementById("screen");
+const $ = (id) => document.getElementById(id);
+const canvas = $("screen");
 const ctx = canvas.getContext("2d");
-const video = document.getElementById("video");
-const menu = document.getElementById("menu");
-const statusEl = document.getElementById("status");
-const btnStart = document.getElementById("start");
+const video = $("video");
 
 let faceLandmarker = null;
 let stream = null;
 let running = false;
-let affected = SIDE.left, healthy = SIDE.right;
-let strength = 1;
 let wakeLock = null;
+let sideName = CONFIG.defaultSide;
+let grade = CONFIG.defaultGrade;
+let showOriginal = false;
 
-let live = null;             // latest tracking: { lm, turn, blink, speed }
+let live = null;          // smoothed tracking: { lm, turn, blend, speed }
 let lastFaceTime = -1e9;
 let lastVideoTime = -1;
-let lm = null;               // landmarks currently used for warping
-let photo = null;            // { canvas, landmarks }
+let neutral = null;       // the person's relaxed face: { lm }
+let eyeRef = null;        // a recent frame with the affected eye open
+let photo = null;         // { canvas, lm, neutralLm }
+let triangles = null;     // Delaunay triangle indices (Uint16Array)
+
+const aff = () => SIDE[sideName];
+const hea = () => SIDE[sideName === "left" ? "right" : "left"];
+const sev = () => GRADES[grade].k * CONFIG.effectScale;
 
 // ---------------------------------------------------------------------------
-// Load the face tracker
+// Load MediaPipe from the CDN (with a local copy as a backup)
 // ---------------------------------------------------------------------------
-async function loadTracker() {
-  try {
-    const files = await FilesetResolver.forVisionTasks(new URL("./lib/wasm", location.href).href);
-    const opts = (delegate) => ({
-      baseOptions: { modelAssetPath: "./models/face_landmarker.task", delegate },
-      runningMode: "VIDEO",
-      numFaces: 1,
-      outputFaceBlendshapes: true,
-      outputFacialTransformationMatrixes: true,
-    });
+const CDN = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+const MODEL_CDN = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+
+async function createLandmarker(base, modelPath) {
+  const { FaceLandmarker, FilesetResolver } = await import(`${base}/vision_bundle.mjs`);
+  const files = await FilesetResolver.forVisionTasks(`${base}/wasm`);
+  for (const delegate of ["GPU", "CPU"]) {
     try {
-      faceLandmarker = await FaceLandmarker.createFromOptions(files, opts("GPU"));
-    } catch (e) {
-      console.warn("GPU not available, using CPU", e);
-      faceLandmarker = await FaceLandmarker.createFromOptions(files, opts("CPU"));
-    }
-    statusEl.textContent = "Ready. Tap Start.";
-    btnStart.disabled = false;
-  } catch (e) {
-    console.error(e);
-    statusEl.textContent = "Could not load the face tracker. Check the internet connection and reload the page.";
+      return await FaceLandmarker.createFromOptions(files, {
+        baseOptions: { modelAssetPath: modelPath, delegate },
+        runningMode: "VIDEO",
+        numFaces: 1,
+        outputFaceBlendshapes: true,
+        outputFacialTransformationMatrixes: true,
+      });
+    } catch (e) { console.warn(`${delegate} failed`, e); }
+  }
+  throw new Error("Face Landmarker could not start");
+}
+
+async function loadTracker() {
+  const local = new URL("./lib", location.href).href;
+  const tries = [[CDN, MODEL_CDN], [local, "./models/face_landmarker.task"]];
+  for (const [base, model] of tries) {
+    try {
+      faceLandmarker = await createLandmarker(base, model);
+      break;
+    } catch (e) { console.warn("Loading from", base, "failed", e); }
+  }
+  if (faceLandmarker) {
+    $("status").textContent = "Ready. Tap Start.";
+    $("start").disabled = false;
+  } else {
+    $("status").textContent = "Could not load the face tracker. Check the internet connection and reload.";
   }
 }
 loadTracker();
 
 // ---------------------------------------------------------------------------
-// WebGL face warp: moves soft areas of the picture ("blobs") and smooths
-// wrinkles/folds in other soft areas
+// Small maths helpers
 // ---------------------------------------------------------------------------
-const MAX_BLOBS = 32;
-const MAX_SMOOTH = 8;
+const clamp01 = (x) => Math.max(0, Math.min(1, x));
+const ease = (x) => { x = clamp01(x); return x * x * (3 - 2 * x); };
+const smoothstep = (a, b, x) => ease((x - a) / (b - a));
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+// Best rotation+scale+shift that moves points `src` onto `dst` (2D Procrustes)
+function similarity(src, dst) {
+  const n = src.length;
+  let sx = 0, sy = 0, dx = 0, dy = 0;
+  for (let i = 0; i < n; i++) { sx += src[i].x; sy += src[i].y; dx += dst[i].x; dy += dst[i].y; }
+  sx /= n; sy /= n; dx /= n; dy /= n;
+  let a = 0, b = 0, d = 0;
+  for (let i = 0; i < n; i++) {
+    const px = src[i].x - sx, py = src[i].y - sy, qx = dst[i].x - dx, qy = dst[i].y - dy;
+    a += px * qx + py * qy;
+    b += px * qy - py * qx;
+    d += px * px + py * py;
+  }
+  a /= d || 1; b /= d || 1;
+  return (p) => ({ x: a * (p.x - sx) - b * (p.y - sy) + dx, y: b * (p.x - sx) + a * (p.y - sy) + dy });
+}
+
+// ---------------------------------------------------------------------------
+// Delaunay triangulation (Bowyer–Watson). Runs once, on the first face seen.
+// ---------------------------------------------------------------------------
+function delaunay(pts) {
+  const n = pts.length;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of pts) {
+    minX = Math.min(minX, p.x); minY = Math.min(minY, p.y);
+    maxX = Math.max(maxX, p.x); maxY = Math.max(maxY, p.y);
+  }
+  const d = Math.max(maxX - minX, maxY - minY) * 20, mx = (minX + maxX) / 2, my = (minY + maxY) / 2;
+  const P = pts.concat([{ x: mx - d, y: my - d }, { x: mx + d, y: my - d }, { x: mx, y: my + d }]);
+  const tri = (a, b, c) => {
+    const A = P[a], B = P[b], C = P[c];
+    const D = 2 * (A.x * (B.y - C.y) + B.x * (C.y - A.y) + C.x * (A.y - B.y));
+    const a2 = A.x * A.x + A.y * A.y, b2 = B.x * B.x + B.y * B.y, c2 = C.x * C.x + C.y * C.y;
+    const ux = (a2 * (B.y - C.y) + b2 * (C.y - A.y) + c2 * (A.y - B.y)) / D;
+    const uy = (a2 * (C.x - B.x) + b2 * (A.x - C.x) + c2 * (B.x - A.x)) / D;
+    return { a, b, c, x: ux, y: uy, r2: (A.x - ux) ** 2 + (A.y - uy) ** 2 };
+  };
+  let tris = [tri(n, n + 1, n + 2)];
+  for (let i = 0; i < n; i++) {
+    const p = P[i];
+    const keep = [], edges = new Map();
+    for (const t of tris) {
+      if ((p.x - t.x) ** 2 + (p.y - t.y) ** 2 < t.r2) {
+        for (const [u, v] of [[t.a, t.b], [t.b, t.c], [t.c, t.a]]) {
+          const key = u < v ? u * 4096 + v : v * 4096 + u;
+          edges.set(key, edges.has(key) ? null : [u, v]);
+        }
+      } else keep.push(t);
+    }
+    for (const e of edges.values()) if (e) keep.push(tri(e[0], e[1], i));
+    tris = keep;
+  }
+  const out = [];
+  for (const t of tris) if (t.a < n && t.b < n && t.c < n) out.push(t.a, t.b, t.c);
+  return new Uint16Array(out);
+}
+
+// All mesh points for a face: 478 landmarks + a ring outside the face + border.
+// The ring and border points never move, which keeps hair/neck/background still.
+const RING = FACE_OVAL.length;
+function meshPoints(lm, w, h) {
+  const c = lm[1];
+  const pts = lm.slice(0, 478);
+  for (const i of FACE_OVAL) {
+    const p = lm[i];
+    pts.push({ x: Math.max(0, Math.min(w, c.x + (p.x - c.x) * 1.3)),
+               y: Math.max(0, Math.min(h, c.y + (p.y - c.y) * 1.3)) });
+  }
+  pts.push({ x: 0, y: 0 }, { x: w / 2, y: 0 }, { x: w, y: 0 }, { x: w, y: h / 2 },
+           { x: w, y: h }, { x: w / 2, y: h }, { x: 0, y: h }, { x: 0, y: h / 2 });
+  return pts;
+}
+const MESH_N = 478 + RING + 8;
+
+// ---------------------------------------------------------------------------
+// WebGL: draws the image through the moved triangle mesh
+// ---------------------------------------------------------------------------
 const glCanvas = document.createElement("canvas");
 const gl = glCanvas.getContext("webgl", { preserveDrawingBuffer: true, premultipliedAlpha: false });
-const frameCanvas = document.createElement("canvas");
-const frameCtx = frameCanvas.getContext("2d");
 
 const VERT = `
-attribute vec2 a_pos;
+attribute vec2 a_dst;   // where the point is drawn (pixels)
+attribute vec2 a_src;   // where the colour is taken from (pixels)
+attribute vec4 a_fx;    // smoothing, lower-lid shadow, colour change, opacity
+uniform vec2 u_res;
 varying vec2 v_uv;
+varying vec4 v_fx;
 void main() {
-  v_uv = vec2(a_pos.x * 0.5 + 0.5, 0.5 - a_pos.y * 0.5);
-  gl_Position = vec4(a_pos, 0.0, 1.0);
+  v_uv = a_src / u_res;
+  v_fx = a_fx;
+  gl_Position = vec4(a_dst.x / u_res.x * 2.0 - 1.0, 1.0 - a_dst.y / u_res.y * 2.0, 0.0, 1.0);
 }`;
 const FRAG = `
 precision highp float;
 uniform sampler2D u_tex;
 uniform vec2 u_res;
-uniform int u_n;
-uniform vec4 u_a[${MAX_BLOBS}];
-uniform vec4 u_b[${MAX_BLOBS}];
-uniform int u_ns;
-uniform vec4 u_s[${MAX_SMOOTH}];
 uniform float u_blur;
 varying vec2 v_uv;
+varying vec4 v_fx;
 void main() {
-  vec2 p = v_uv * u_res;
-  vec2 d = vec2(0.0);
-  for (int i = 0; i < ${MAX_BLOBS}; i++) {
-    if (i >= u_n) break;
-    vec2 q = p - u_a[i].xy;
-    float r = u_a[i].z;
-    d += exp(-dot(q, q) / (r * r)) * u_b[i].xy;
-  }
-  vec2 sp = p - d;
-  vec4 c = texture2D(u_tex, clamp(sp / u_res, 0.0, 1.0));
-  float m = 0.0;
-  for (int i = 0; i < ${MAX_SMOOTH}; i++) {
-    if (i >= u_ns) break;
-    vec2 q = p - u_s[i].xy;
-    float r = u_s[i].z;
-    m = max(m, u_s[i].w * exp(-dot(q, q) / (r * r)));
-  }
-  if (m > 0.01) {
+  vec4 c = texture2D(u_tex, v_uv);
+  // smoothing: soften wrinkles / the nasolabial fold with a small round blur
+  if (v_fx.x > 0.01) {
     vec4 acc = c;
     for (int k = 0; k < 12; k++) {
       float a = float(k) * 0.5236;
-      vec2 dir = vec2(cos(a), sin(a));
-      acc += texture2D(u_tex, clamp((sp + dir * u_blur * 0.5) / u_res, 0.0, 1.0));
-      acc += texture2D(u_tex, clamp((sp + dir * u_blur) / u_res, 0.0, 1.0));
+      vec2 o = vec2(cos(a), sin(a)) * u_blur / u_res;
+      acc += texture2D(u_tex, v_uv + o * 0.5) + texture2D(u_tex, v_uv + o);
     }
-    c = mix(c, acc / 25.0, m);
+    c = mix(c, acc / 25.0, v_fx.x);
   }
-  gl_FragColor = c;
+  // very light shadow under the lower lid
+  c.rgb *= 1.0 - v_fx.y;
+  // slight colour change on the affected side (a little paler / flatter)
+  float lum = dot(c.rgb, vec3(0.299, 0.587, 0.114));
+  c.rgb = mix(c.rgb, vec3(lum) * 1.03, v_fx.z);
+  gl_FragColor = vec4(c.rgb, v_fx.w);
 }`;
 
 function compile(type, src) {
@@ -176,380 +290,404 @@ gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
 gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG));
 gl.linkProgram(prog);
 gl.useProgram(prog);
-const buf = gl.createBuffer();
-gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
-const aPos = gl.getAttribLocation(prog, "a_pos");
-gl.enableVertexAttribArray(aPos);
-gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
-const tex = gl.createTexture();
-gl.bindTexture(gl.TEXTURE_2D, tex);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-const U = (name) => gl.getUniformLocation(prog, name);
-const uRes = U("u_res"), uN = U("u_n"), uA = U("u_a"), uB = U("u_b");
-const uNs = U("u_ns"), uS = U("u_s"), uBlur = U("u_blur");
-const blobA = new Float32Array(MAX_BLOBS * 4);
-const blobB = new Float32Array(MAX_BLOBS * 4);
-const smoothS = new Float32Array(MAX_SMOOTH * 4);
+const aDst = gl.getAttribLocation(prog, "a_dst");
+const aSrc = gl.getAttribLocation(prog, "a_src");
+const aFx = gl.getAttribLocation(prog, "a_fx");
+const uRes = gl.getUniformLocation(prog, "u_res");
+const uBlur = gl.getUniformLocation(prog, "u_blur");
+const vbo = gl.createBuffer();
+const ibo = gl.createBuffer();
+const ibo2 = gl.createBuffer();
+const VSIZE = 8; // floats per point: dst(2) src(2) fx(4)
+const vdata = new Float32Array(MESH_N * VSIZE);
+let patchCount = 0, patchSide = null;
 
-// Draws `source` (the photo), changed by `fx`, into frameCanvas.
-function renderWarp(source, fx) {
-  const w = source.width, h = source.height;
-  if (glCanvas.width !== w || glCanvas.height !== h) {
-    glCanvas.width = frameCanvas.width = w;
-    glCanvas.height = frameCanvas.height = h;
-  }
-  gl.viewport(0, 0, w, h);
+function makeTexture() {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  return t;
+}
+const texMain = makeTexture();
+const texEye = makeTexture();
+let texEyeDirty = false;
+
+function upload(tex, source) {
   gl.bindTexture(gl.TEXTURE_2D, tex);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
-  const n = Math.min(fx.blobs.length, MAX_BLOBS);
-  blobA.fill(0); blobB.fill(0); smoothS.fill(0);
-  for (let i = 0; i < n; i++) {
-    const b = fx.blobs[i];
-    blobA.set([b.x, b.y, b.r, 0], i * 4);
-    blobB.set([b.dx, b.dy, 0, 0], i * 4);
-  }
-  const ns = Math.min(fx.smooth.length, MAX_SMOOTH);
-  for (let i = 0; i < ns; i++) {
-    const s = fx.smooth[i];
-    smoothS.set([s.x, s.y, s.r, s.amount], i * 4);
-  }
-  gl.uniform2f(uRes, w, h);
-  gl.uniform1i(uN, n);
-  gl.uniform4fv(uA, blobA);
-  gl.uniform4fv(uB, blobB);
-  gl.uniform1i(uNs, ns);
-  gl.uniform4fv(uS, smoothS);
-  gl.uniform1f(uBlur, fx.blur);
-  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-  frameCtx.drawImage(glCanvas, 0, 0);
+}
+
+function bindVertices() {
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, vdata, gl.DYNAMIC_DRAW);
+  const F = 4;
+  gl.enableVertexAttribArray(aDst); gl.vertexAttribPointer(aDst, 2, gl.FLOAT, false, VSIZE * F, 0);
+  gl.enableVertexAttribArray(aSrc); gl.vertexAttribPointer(aSrc, 2, gl.FLOAT, false, VSIZE * F, 2 * F);
+  gl.enableVertexAttribArray(aFx);  gl.vertexAttribPointer(aFx, 4, gl.FLOAT, false, VSIZE * F, 4 * F);
 }
 
 // ---------------------------------------------------------------------------
-// Face geometry helpers (use the landmarks in `lm`)
+// THE PALSY WARP – works out how far every mesh point moves
 // ---------------------------------------------------------------------------
-const P = (i) => lm[i];
+// Distances below are in pixels for a face whose outer eye corners are
+// REF_EYE px apart; they are scaled to the real face size and by severity.
+const REF_EYE = 150;
 
-function faceFrame() {
-  const top = P(10), chin = P(152);
-  const dx = chin.x - top.x, dy = chin.y - top.y;
-  const len = Math.hypot(dx, dy) || 1;
-  const down = { x: dx / len, y: dy / len };
-  const a = P(affected.eyeOuter), b = P(healthy.eyeOuter);
-  const s = Math.hypot(a.x - b.x, a.y - b.y); // face scale: width between outer eye corners
-  const out = { x: (a.x - b.x) / (s || 1), y: (a.y - b.y) / (s || 1) }; // toward the affected side
-  return { down, out, s };
-}
-
-// Builds the changes for the given symptom strengths `w` (0..1 each).
-function buildEffects(w) {
-  const { down, out, s } = faceFrame();
-  const k = strength;
-  const blobs = [], smooth = [];
-  // move a soft area at landmark i (radius r) by `dn` down and `dout` toward the affected side
-  // (all × face scale). `up` shifts the centre of the area upward.
-  const add = (i, r, dn, dout, amount, up = 0) => {
-    if (amount <= 0) return;
-    const p = P(i);
-    blobs.push({
-      x: p.x - down.x * up * s, y: p.y - down.y * up * s, r: r * s,
-      dx: (down.x * dn + out.x * dout) * s * amount * k,
-      dy: (down.y * dn + out.y * dout) * s * amount * k,
-    });
-  };
-  // smooth out wrinkles / folds around landmark i
-  const flat = (i, r, amount, up = 0) => {
-    if (amount <= 0) return;
-    const p = P(i);
-    smooth.push({ x: p.x - down.x * up * s, y: p.y - down.y * up * s, r: r * s, amount: Math.min(1, amount) });
-  };
-
-  // 1. Eyebrow droops (the outer end most), forehead smooth (no wrinkles)
-  add(affected.brow[1], 0.28, 0.2, 0, w.brow, 0.06);
-  add(affected.brow[0], 0.2, 0.11, 0, w.brow, 0.03);
-  flat(affected.brow[1], 0.2, 0.6 * w.brow, 0.3);
-
-  // 2. Eye cannot close: when trying to close both eyes only the healthy eye
-  //    closes (w.close = 0..1); the affected lower lid sags a little
-  add(affected.lowerLid, 0.09, 0.04, 0, w.eye, -0.05);
-  if (w.close > 0) {
-    const open = Math.hypot(P(healthy.upperLid).x - P(healthy.lowerLid).x,
-                            P(healthy.upperLid).y - P(healthy.lowerLid).y) / s;
-    const dn = open * 1.2 + 0.015;
-    add(healthy.lowerLid, Math.max(0.09, dn * 1.1), -dn, 0, w.close, -0.04);
-  }
-
-  // 3. Cheek sags, the nose-to-mouth fold is flattened
-  add(affected.fold, 0.28, 0.13, 0.03, w.cheek);
-  add(affected.noseWing, 0.13, 0.05, 0, w.cheek);
-  flat(affected.fold, 0.24, 0.9 * w.cheek);
-
-  // 4. Mouth twisted toward the healthy side; the affected half hangs down
-  add(13, 0.30, 0, -0.04, w.mouth);                          // whole mouth shifts
-  add(affected.mouthCorner, 0.16, 0.15, -0.02, w.mouth);
-  add(affected.lowerLip, 0.11, 0.09, 0, w.mouth);
-  add(affected.upperLip, 0.11, 0.07, 0, w.mouth);
-  add(14, 0.10, 0.04, 0, w.mouth);
-  add(healthy.mouthCorner, 0.13, -0.04, -0.04, w.mouth);    // healthy corner pulled up and out
-  flat(affected.fold, 0.2, 0.6 * w.mouth);
-
-  // 5. Drooling: the corner sags a little, the saliva is drawn on top
-  add(affected.mouthCorner, 0.15, 0.08, 0, w.drool);
-
-  return { blobs, smooth, blur: 0.03 * s };
-}
-
-// Where a landmark ends up after warping (so tears/drool follow the warped face)
-function warpedPoint(i, blobs) {
-  const p = P(i);
-  let x = p.x, y = p.y;
-  for (const b of blobs) {
-    const qx = p.x - b.x, qy = p.y - b.y;
-    const f = Math.exp(-(qx * qx + qy * qy) / (b.r * b.r));
-    x += f * b.dx; y += f * b.dy;
-  }
-  return { x, y };
-}
-
-// ---------------------------------------------------------------------------
-// Tears and drool (drawn on top of the changed photo)
-// ---------------------------------------------------------------------------
-function drawDrop(c, x, y, r, alpha) {
-  const g = c.createRadialGradient(x - r * 0.35, y - r * 0.35, r * 0.1, x, y, r * 1.1);
-  g.addColorStop(0, `rgba(255,255,255,${0.95 * alpha})`);
-  g.addColorStop(0.35, `rgba(215,235,255,${0.6 * alpha})`);
-  g.addColorStop(1, `rgba(150,195,240,${0.35 * alpha})`);
-  c.fillStyle = g;
-  c.beginPath();
-  c.moveTo(x, y - r * 2.2);
-  c.bezierCurveTo(x + r * 0.25, y - r * 1.3, x + r, y - r * 0.7, x + r, y);
-  c.arc(x, y, r, 0, Math.PI);
-  c.bezierCurveTo(x - r, y - r * 0.7, x - r * 0.25, y - r * 1.3, x, y - r * 2.2);
-  c.fill();
-}
-
-function drawStream(c, x, y, len, width, alpha) {
-  const g = c.createLinearGradient(x - width, 0, x + width, 0);
-  g.addColorStop(0, `rgba(170,205,240,${0.35 * alpha})`);
-  g.addColorStop(0.4, `rgba(255,255,255,${0.85 * alpha})`);
-  g.addColorStop(1, `rgba(170,205,240,${0.4 * alpha})`);
-  c.fillStyle = g;
-  c.beginPath();
-  c.moveTo(x - width, y);
-  c.quadraticCurveTo(x - width * 0.4, y + len * 0.6, x - width * 0.3, y + len);
-  c.lineTo(x + width * 0.3, y + len);
-  c.quadraticCurveTo(x + width * 0.4, y + len * 0.6, x + width, y);
-  c.closePath();
-  c.fill();
-}
-
-// t = seconds since the effect started
-function drawOverlays(c, w, blobs, t) {
-  const { down, s } = faceFrame();
-  const angle = Math.atan2(down.y, down.x) - Math.PI / 2;
-
-  if (w.eye > 0) { // tears rolling down from the outer lower eyelid
-    const p = warpedPoint(affected.lowerLidOuter, blobs);
-    c.save();
-    c.translate(p.x, p.y + 0.01 * s);
-    c.rotate(angle);
-    for (let n = 0; n < 2; n++) {
-      const phase = ((t + n * 2.2) % 4.4) / 4.4;
-      const y = phase * phase * 0.8 * s;
-      const a = w.eye * Math.min(1, phase * 6) * (1 - phase);
-      drawDrop(c, 0, y, 0.035 * s, a);
-    }
-    drawDrop(c, 0, 0.015 * s, 0.02 * s, w.eye * 0.9); // wet rim
-    c.restore();
-  }
-
-  if (w.close > 0) { // eyelashes of the closed healthy eye
-    const pts = [healthy === SIDE.left ? 362 : 133, healthy.lowerLidInner, healthy.lowerLid,
-                 healthy.lowerLidOuter, healthy.eyeOuter].map((i) => warpedPoint(i, blobs));
-    const lift = 0.02 * s;
-    c.save();
-    c.strokeStyle = `rgba(40,25,20,${0.75 * w.close})`;
-    c.lineWidth = 0.018 * s;
-    c.lineCap = "round";
-    c.beginPath();
-    c.moveTo(pts[0].x, pts[0].y - lift);
-    for (let i = 1; i < pts.length; i++) c.lineTo(pts[i].x, pts[i].y - lift * (i === 4 ? 1 : 1.3));
-    c.stroke();
-    c.restore();
-  }
-
-  if (w.drool > 0) { // saliva from the affected mouth corner
-    const p = warpedPoint(affected.mouthCorner, blobs);
-    c.save();
-    c.translate(p.x, p.y);
-    c.rotate(angle);
-    const len = 0.3 * s * Math.min(1, t / 2) * (0.9 + 0.1 * Math.sin(t * 2));
-    drawStream(c, 0, 0, len, 0.03 * s, w.drool * 0.6);
-    const phase = (t % 3.2) / 3.2;
-    const grow = Math.min(1, phase * 2.5);
-    const fall = Math.max(0, phase - 0.4) / 0.6;
-    drawDrop(c, 0, len + 0.025 * s + fall * fall * 0.9 * s, (0.016 + 0.02 * grow) * s,
-             w.drool * (1 - fall * 0.8) * Math.min(1, t / 2));
-    c.restore();
-  }
-}
-
-// Where to draw the yellow "look here" circle for each symptom
-function highlightFor(key) {
-  const { down, s } = faceFrame();
-  const at = (i, r, dn = 0) => ({ x: P(i).x + down.x * dn * s, y: P(i).y + down.y * dn * s, r: r * s });
-  if (key === "brow") return at(affected.brow[1], 0.32, -0.05);
-  if (key === "eye") return at(affected.lowerLid, 0.24);
-  if (key === "cheek") return at(affected.fold, 0.34, -0.05);
-  if (key === "mouth") return at(affected.mouthCorner, 0.3);
-  if (key === "drool") return at(affected.mouthCorner, 0.36, 0.15);
-  return null;
-}
-
-// ---------------------------------------------------------------------------
-// Steps of the experience
-// ---------------------------------------------------------------------------
-function buildSteps() {
-  const steps = [
-    { type: "countdown", dur: CONFIG.countdownSeconds },
-    { type: "title", dur: CONFIG.titleSeconds },
+// Handles: a point is moved by `down`/`out` pixels (out = toward the ear on
+// the affected side). Nearby points follow with a Gaussian falloff (sigma).
+function handles(S) {
+  return [
+    // BROW: the eyebrow sags (outer part most) – peripheral palsy
+    // (the movement fades out before the upper eyelid, so the eye stays open)
+    { group: "brow", i: S.browMid,   down: 11, out: 0, sigma: 35, stop: S.upperLid },
+    { group: "brow", i: S.browOuter, down: 10, out: 0, sigma: 30, stop: S.upperLid },
+    { group: "brow", i: S.browInner, down: 5,  out: 0, sigma: 25, stop: S.upperLid },
+    // EYE: eye looks wider (upper lid slightly up) and the lower lid sags.
+    // Small sigma so the iris is not touched (iris points are also pinned).
+    { group: "eye", i: S.upperLid,      down: -2.5, out: 0, sigma: 12 },
+    { group: "eye", i: S.lowerLid,      down: 6,    out: 0, sigma: 14 },
+    { group: "eye", i: S.lowerLidOuter, down: 4,    out: 0, sigma: 12 },
+    // CHEEK: mild sag; the nasolabial fold moves out a little (flatter)
+    { group: "cheek", i: S.fold,     down: 6, out: 2, sigma: 35 },
+    { group: "cheek", i: S.cheek,    down: 5, out: 0, sigma: 40 },
+    { group: "cheek", i: S.noseWing, down: 2, out: 0, sigma: 20 },
+    // MOUTH: corner pulled down 8-15 px and slightly outward;
+    // the upper lip on that side is flattened (pushed down a little)
+    { group: "mouth", i: S.mouthCorner, down: 15, out: 3, sigma: 30 },
+    { group: "mouth", i: S.upperLip[0], down: 3,  out: 0, sigma: 14 },
+    { group: "mouth", i: S.upperLip[1], down: 3,  out: 0, sigma: 14 },
+    { group: "mouth", i: S.lowerLip,    down: 3,  out: 0, sigma: 15 },
   ];
-  SYMPTOMS.forEach((sym, i) => {
-    steps.push({ type: "photo", label: `Photo ${i + 1} of ${SYMPTOMS.length + 1}` });
-    steps.push({ type: "symptom", dur: CONFIG.symptomSeconds, index: i });
-  });
-  steps.push({ type: "photo", label: `Photo ${SYMPTOMS.length + 1} of ${SYMPTOMS.length + 1}` });
-  steps.push({ type: "final", dur: CONFIG.finalSeconds });
-  steps.push({ type: "thanks", dur: CONFIG.thanksSeconds });
-  return steps;
 }
 
-let steps = [];
-let stepIndex = 0;
-let stepStart = 0;
-let goodSince = null;   // when the face got into a good position (photo step)
-let lastProblem = null;
+const FACE_OVAL_SET = new Set(FACE_OVAL);
 
-function nextStep(now) {
-  stepIndex++;
-  stepStart = now;
-  goodSince = null;
-  if (stepIndex >= steps.length) stopExperience();
+// Signed distance from p to the facial midline (positive = affected side)
+function midlineSide(lm, p, out) {
+  let best = Infinity, bx = 0, by = 0;
+  for (let k = 0; k < MIDLINE.length - 1; k++) {
+    const a = lm[MIDLINE[k]], b = lm[MIDLINE[k + 1]];
+    const vx = b.x - a.x, vy = b.y - a.y;
+    const t = clamp01(((p.x - a.x) * vx + (p.y - a.y) * vy) / (vx * vx + vy * vy || 1));
+    const cx = a.x + vx * t, cy = a.y + vy * t;
+    const d = (p.x - cx) ** 2 + (p.y - cy) ** 2;
+    if (d < best) { best = d; bx = cx; by = cy; }
+  }
+  const s = Math.sqrt(best);
+  return (p.x - bx) * out.x + (p.y - by) * out.y >= 0 ? s : -s;
 }
 
-const ease = (x) => { x = Math.max(0, Math.min(1, x)); return x * x * (3 - 2 * x); };
+// Fills vdata for the face `lm`.
+//   w        : which symptom groups are on (0..1 each)
+//   neutralLm: the relaxed face placed onto this frame (or null) – used to
+//              make the affected side move less when smiling / raising brows
+function buildMesh(lm, imgW, imgH, w, neutralLm) {
+  const S = aff(), k = sev();
+  const pts = meshPoints(lm, imgW, imgH);
+
+  // face directions and size
+  const down0 = { x: lm[152].x - lm[10].x, y: lm[152].y - lm[10].y };
+  const dl = Math.hypot(down0.x, down0.y) || 1;
+  const down = { x: down0.x / dl, y: down0.y / dl };
+  const eyeD = dist(lm[S.eyeOuter], lm[hea().eyeOuter]);
+  const out = { x: (lm[S.eyeOuter].x - lm[hea().eyeOuter].x) / eyeD, y: (lm[S.eyeOuter].y - lm[hea().eyeOuter].y) / eyeD };
+  const px = eyeD / REF_EYE; // pixels-per-reference-pixel for this face
+
+  const H = handles(S).filter((h) => w[h.group] > 0).map((h) => ({
+    x: lm[h.i].x, y: lm[h.i].y, s2: 2 * (h.sigma * px) ** 2, group: h.group,
+    dx: (down.x * h.down + out.x * h.out) * px * k * w[h.group],
+    dy: (down.y * h.down + out.y * h.out) * px * k * w[h.group],
+    // how far below the handle (along "down") the movement has faded to zero
+    stopAt: h.stop === undefined ? Infinity
+      : (lm[h.stop].x - lm[h.i].x) * down.x + (lm[h.stop].y - lm[h.i].y) * down.y,
+  }));
+  // sum of all Gaussian handles at point p
+  const handleSum = (p, skipEye) => {
+    let x = 0, y = 0;
+    for (const h of H) {
+      if (skipEye && h.group === "eye") continue;
+      let f = Math.exp(-((p.x - h.x) ** 2 + (p.y - h.y) ** 2) / h.s2);
+      if (h.stopAt !== Infinity) {
+        const t = (p.x - h.x) * down.x + (p.y - h.y) * down.y;
+        f *= 1 - smoothstep(0, h.stopAt, t);
+      }
+      x += f * h.dx; y += f * h.dy;
+    }
+    return { x, y };
+  };
+  // the iris moves as one piece (never stretched) and ignores the eyelid handles
+  const irisMove = handleSum(lm[S.iris[0]], true);
+  const gauss = (p, q, sigma) => Math.exp(-((p.x - q.x) ** 2 + (p.y - q.y) ** 2) / (2 * (sigma * px) ** 2));
+  const pinned = new Set(S.iris);
+  const lids = new Set([...S.upper, ...S.lower, S.eyeInner, S.eyeOuter]);
+  const eyeLineY = (lm[S.eyeInner].y + lm[hea().eyeInner].y) / 2;
+  const noseY = lm[1].y;
+  const anyOn = Math.max(w.brow, w.eye, w.cheek, w.mouth);
+  const shadowAt = { x: lm[S.lowerLid].x + down.x * 0.07 * eyeD, y: lm[S.lowerLid].y + down.y * 0.07 * eyeD };
+  // turn the "move less" effect off when the head is turned (2D maths gets unreliable)
+  const frontal = live ? 1 - smoothstep(10, 25, live.turn) : 1;
+
+  for (let v = 0; v < MESH_N; v++) {
+    const p = pts[v];
+    let dx = 0, dy = 0, smooth = 0, shade = 0, tone = 0;
+    if (pinned.has(v) && k > 0) {
+      const side = smoothstep(0, 0.12 * eyeD, midlineSide(lm, p, out));
+      dx = irisMove.x * side; dy = irisMove.y * side;
+    } else if (v < 478 && !FACE_OVAL_SET.has(v) && k > 0) {
+      // only real face points inside the face outline may move
+      // the unaffected side stays untouched; fade in over a short distance
+      const side = smoothstep(0, 0.12 * eyeD, midlineSide(lm, p, out));
+      if (side > 0) {
+        // 1) the static palsy shape: sum of Gaussian handles
+        const m = handleSum(p, false);
+        dx += m.x; dy += m.y;
+        // 2) dynamic: the affected side follows expressions only partly.
+        //    Brows don't move at all (keep 0%), mouth/cheek keep 20-40%.
+        if (neutralLm && !lids.has(v)) {
+          const isBrow = p.y < eyeLineY;
+          const isMouth = p.y > noseY;
+          const gw = isBrow ? w.brow : isMouth ? Math.max(w.mouth, w.cheek) : w.cheek;
+          const retain = isBrow ? 1 - k : 1 - 0.7 * k;
+          const n = neutralLm[v];
+          dx += (n.x - p.x) * (1 - retain) * gw * frontal;
+          dy += (n.y - p.y) * (1 - retain) * gw * frontal;
+        }
+        dx *= side; dy *= side;
+        // 3) skin effects: smooth forehead wrinkles and the nasolabial fold
+        smooth = Math.max(
+          0.85 * w.brow * gauss(p, lm[S.forehead], 45),
+          0.75 * w.cheek * gauss(p, lm[S.fold], 28)) * k * side;
+        // 4) very subtle lower-lid shadow and colour change
+        shade = 0.12 * w.eye * k * side * gauss(p, shadowAt, 16);
+        tone = 0.05 * anyOn * k * side;
+      }
+    }
+    const o = v * VSIZE;
+    vdata[o] = p.x + dx; vdata[o + 1] = p.y + dy;   // drawn here
+    vdata[o + 2] = p.x;  vdata[o + 3] = p.y;        // colour from here
+    vdata[o + 4] = Math.min(1, smooth); vdata[o + 5] = shade; vdata[o + 6] = tone; vdata[o + 7] = 1;
+  }
+  return { eyeD, down };
+}
+
+// Renders `source` (video or photo canvas) with the palsy warp into glCanvas.
+function renderFace(source, lm, w, neutralLm, eyeClose = 0) {
+  const W = source.videoWidth || source.width, Hh = source.videoHeight || source.height;
+  if (glCanvas.width !== W || glCanvas.height !== Hh) { glCanvas.width = W; glCanvas.height = Hh; }
+  gl.viewport(0, 0, W, Hh);
+  gl.clearColor(0, 0, 0, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  upload(texMain, source);
+  gl.uniform2f(uRes, W, Hh);
+  if (!triangles || !lm) {
+    // no face: show the picture as it is
+    const quad = [[0, 0], [W, 0], [0, Hh], [W, Hh]];
+    quad.forEach(([x, y], i) => vdata.set([x, y, x, y, 0, 0, 0, 1], i * VSIZE));
+    bindVertices();
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    return;
+  }
+  const { eyeD, down } = buildMesh(lm, W, Hh, w, neutralLm);
+  bindVertices();
+  gl.uniform1f(uBlur, 0.025 * eyeD);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+  gl.drawElements(gl.TRIANGLES, triangles.length, gl.UNSIGNED_SHORT, 0);
+
+  // Live only: when the person closes their eyes, the affected eye stays
+  // slightly open. We draw the eye area from a recent "eye open" frame on top.
+  if (eyeClose > 0.01 && eyeRef && w.eye > 0) drawOpenEye(lm, eyeD, down, eyeClose * w.eye);
+}
+
+// Eye-region triangles (rebuilt when the side or reference frame changes)
+function buildPatch() {
+  const S = aff(), lm = eyeRef.lm;
+  const c = { x: (lm[S.eyeInner].x + lm[S.eyeOuter].x) / 2, y: (lm[S.eyeInner].y + lm[S.eyeOuter].y) / 2 };
+  const eyeD = dist(lm[S.eyeOuter], lm[hea().eyeOuter]);
+  const inside = (i) => i < 478 && dist(lm[i], c) < 0.42 * eyeD;
+  const idx = [];
+  for (let t = 0; t < triangles.length; t += 3) {
+    if (inside(triangles[t]) && inside(triangles[t + 1]) && inside(triangles[t + 2])) idx.push(triangles[t], triangles[t + 1], triangles[t + 2]);
+  }
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo2);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(idx), gl.STATIC_DRAW);
+  patchCount = idx.length;
+  patchSide = sideName;
+}
+
+function drawOpenEye(lm, eyeD, down, amount) {
+  const S = aff();
+  if (patchSide !== sideName || !patchCount) buildPatch();
+  if (texEyeDirty) { upload(texEye, eyeRef.canvas); texEyeDirty = false; }
+  const ref = eyeRef.lm;
+  // place the old eye onto the current face
+  const anchorIdx = [S.eyeInner, S.eyeOuter, 168, 6, S.browMid];
+  const map = similarity(anchorIdx.map((i) => ref[i]), anchorIdx.map((i) => lm[i]));
+  const c = { x: (lm[S.eyeInner].x + lm[S.eyeOuter].x) / 2, y: (lm[S.eyeInner].y + lm[S.eyeOuter].y) / 2 };
+  const opening = dist(ref[S.upperLid], ref[S.lowerLid]);
+  const upper = new Set(S.upper);
+  const vis = smoothstep(0.35, 0.75, amount) * Math.min(1, sev() * 1.6);
+  for (let v = 0; v < 478; v++) {
+    const q = map(ref[v]);
+    // "slightly open": the upper lid comes down 45% of the way
+    if (upper.has(v)) { q.x += down.x * opening * 0.45 * vis; q.y += down.y * opening * 0.45 * vis; }
+    const o = v * VSIZE;
+    vdata[o] = q.x; vdata[o + 1] = q.y;
+    vdata[o + 2] = ref[v].x; vdata[o + 3] = ref[v].y;
+    // soft edge so the patch blends in
+    const a = vis * (1 - smoothstep(0.18 * eyeD, 0.38 * eyeD, dist(q, c)));
+    vdata[o + 4] = 0; vdata[o + 5] = 0.04 * vis; vdata[o + 6] = 0; vdata[o + 7] = a;
+  }
+  bindVertices();
+  gl.bindTexture(gl.TEXTURE_2D, texEye);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo2);
+  gl.drawElements(gl.TRIANGLES, patchCount, gl.UNSIGNED_SHORT, 0);
+  gl.disable(gl.BLEND);
+  gl.bindTexture(gl.TEXTURE_2D, texMain);
+}
 
 // ---------------------------------------------------------------------------
-// Live face tracking
+// Face tracking with jitter smoothing (exponential moving average)
 // ---------------------------------------------------------------------------
+const EMA = 0.5; // 1 = no smoothing, lower = smoother
+
+function blendScore(cats, ...names) {
+  let m = 0;
+  for (const c of cats) if (names.includes(c.categoryName)) m = Math.max(m, c.score);
+  return m;
+}
+
+function eyeOpenness(lm, S) {
+  return dist(lm[S.upperLid], lm[S.lowerLid]) / (dist(lm[S.eyeInner], lm[S.eyeOuter]) || 1);
+}
+
 function track(now) {
   if (!faceLandmarker || video.readyState < 2 || video.currentTime === lastVideoTime) return;
   lastVideoTime = video.currentTime;
   const res = faceLandmarker.detectForVideo(video, now);
   const face = res.faceLandmarks && res.faceLandmarks[0];
-  if (!face) { live = null; return; }
+  if (!face) { if (now - lastFaceTime > 400) live = null; return; }
   const vw = video.videoWidth, vh = video.videoHeight;
-  const pts = face.map((p) => ({ x: p.x * vw, y: p.y * vh }));
+  const raw = face.map((p) => ({ x: p.x * vw, y: p.y * vh }));
 
-  // how far the head is turned away from the camera (degrees)
+  // low-pass filter on the points
+  let lm;
+  if (live && now - lastFaceTime < 400) {
+    lm = live.lm;
+    for (let i = 0; i < raw.length; i++) {
+      lm[i].x += (raw[i].x - lm[i].x) * EMA;
+      lm[i].y += (raw[i].y - lm[i].y) * EMA;
+    }
+  } else lm = raw;
+
+  // head turn (degrees away from facing the camera)
   let turn = 0;
   const m = res.facialTransformationMatrixes && res.facialTransformationMatrixes[0];
   if (m) {
-    const d = m.data;
-    const n = Math.hypot(d[8], d[9], d[10]) || 1;
+    const d = m.data, n = Math.hypot(d[8], d[9], d[10]) || 1;
     turn = Math.acos(Math.min(1, Math.abs(d[10]) / n)) * 180 / Math.PI;
   }
-  // are the eyes closed?
-  let blink = 0;
-  const bs = res.faceBlendshapes && res.faceBlendshapes[0];
-  if (bs) for (const c of bs.categories) {
-    if (c.categoryName === "eyeBlinkLeft" || c.categoryName === "eyeBlinkRight") blink = Math.max(blink, c.score);
-  }
-  // how fast the head moves (face heights per second)
+  const cats = (res.faceBlendshapes && res.faceBlendshapes[0] && res.faceBlendshapes[0].categories) || [];
+  const blend = {
+    smile: blendScore(cats, "mouthSmileLeft", "mouthSmileRight"),
+    brow: blendScore(cats, "browInnerUp", "browOuterUpLeft", "browOuterUpRight"),
+    blink: blendScore(cats, "eyeBlinkLeft", "eyeBlinkRight"),
+    jaw: blendScore(cats, "jawOpen"),
+  };
   let speed = 0;
-  if (live && now - lastFaceTime < 500) {
-    const fh = Math.hypot(pts[152].x - pts[10].x, pts[152].y - pts[10].y) || 1;
-    const dist = Math.hypot(pts[1].x - live.lm[1].x, pts[1].y - live.lm[1].y) / fh;
-    const inst = dist / Math.max(0.016, (now - lastFaceTime) / 1000);
+  if (live && now - lastFaceTime < 400) {
+    const fh = dist(lm[10], lm[152]) || 1;
+    const inst = dist(raw[1], live.prevNose) / fh / Math.max(0.016, (now - lastFaceTime) / 1000);
     speed = live.speed * 0.7 + inst * 0.3;
   }
-  live = { lm: pts, turn, blink, speed };
+  live = { lm, turn, blend, speed, prevNose: { ...raw[1] }, eyeClose: live ? live.eyeClose : 0 };
   lastFaceTime = now;
+
+  if (!triangles) {
+    triangles = delaunay(meshPoints(lm, vw, vh));
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, triangles, gl.STATIC_DRAW);
+  }
+  updateNeutral();
+  updateEyeRef(now);
+}
+
+// Learn the relaxed face while the person is not making an expression
+function updateNeutral() {
+  const b = live.blend;
+  if (b.smile > 0.25 || b.brow > 0.3 || b.blink > 0.35 || b.jaw > 0.2 || live.turn > 12) return;
+  const lm = live.lm;
+  if (!neutral) { neutral = { lm: lm.map((p) => ({ ...p })) }; return; }
+  // bring the current face into the neutral face's position, then average
+  const map = similarity(ANCHORS.map((i) => lm[i]), ANCHORS.map((i) => neutral.lm[i]));
+  for (let i = 0; i < lm.length; i++) {
+    const q = map(lm[i]);
+    neutral.lm[i].x += (q.x - neutral.lm[i].x) * 0.05;
+    neutral.lm[i].y += (q.y - neutral.lm[i].y) * 0.05;
+  }
+}
+
+// The neutral face placed onto face `lm` (same head position / size)
+function neutralOn(lm) {
+  if (!neutral) return null;
+  const map = similarity(ANCHORS.map((i) => neutral.lm[i]), ANCHORS.map((i) => lm[i]));
+  return neutral.lm.map(map);
+}
+
+// Keep a recent frame where the affected eye is open
+let eyeRefTime = 0;
+function updateEyeRef(now) {
+  const S = aff();
+  const open = eyeOpenness(live.lm, S);
+  live.eyeClose = eyeRef ? clamp01(1 - open / (eyeRef.open || 1)) : 0;
+  if (live.blend.blink > 0.25 || open < 0.18 || live.turn > 15 || now - eyeRefTime < 300) return;
+  if (eyeRef && open < eyeRef.open * 0.85 && now - eyeRefTime < 3000) return;
+  if (!eyeRef) eyeRef = { canvas: document.createElement("canvas") };
+  const c = eyeRef.canvas;
+  c.width = video.videoWidth; c.height = video.videoHeight;
+  c.getContext("2d").drawImage(video, 0, 0);
+  eyeRef.lm = live.lm.map((p) => ({ ...p }));
+  eyeRef.open = open;
+  eyeRefTime = now;
+  texEyeDirty = true;
+  patchSide = null; // rebuild the eye triangles for the new frame
 }
 
 const faceVisible = (now) => live && now - lastFaceTime < 400;
 
 // ---------------------------------------------------------------------------
-// Taking a photo
+// Steps of the experience
 // ---------------------------------------------------------------------------
-function takePhoto() {
-  const vw = video.videoWidth, vh = video.videoHeight;
-  const c = document.createElement("canvas");
-  c.width = vw; c.height = vh;
-  c.getContext("2d").drawImage(video, 0, 0, vw, vh);
-  photo = { canvas: c, landmarks: live.lm.map((p) => ({ x: p.x, y: p.y })) };
+let steps = [], stepIndex = 0, stepStart = 0, goodSince = null, lastProblem = null;
+
+function buildSteps() {
+  const s = [
+    { type: "countdown", dur: CONFIG.countdownSeconds },
+    { type: "title", dur: CONFIG.titleSeconds },
+    { type: "live", dur: CONFIG.promptSeconds * PROMPTS.length },
+    { type: "photo" },
+  ];
+  SYMPTOMS.forEach((sym, i) => s.push({ type: "symptom", dur: CONFIG.symptomSeconds, index: i }));
+  s.push({ type: "final", dur: CONFIG.finalSeconds });
+  s.push({ type: "thanks", dur: CONFIG.thanksSeconds });
+  return s;
 }
 
-// Part of the photo to show, with the given width/height shape, face filling it
-function cropFor(aspect) {
-  let minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
-  for (const p of photo.landmarks) {
-    minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
-    minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y);
-  }
-  const fw = maxX - minX, fh = maxY - minY;
-  let ch = fh / 0.8, cw = ch * aspect;
-  if (cw < fw / 0.8) { cw = fw / 0.8; ch = cw / aspect; }
-  const vw = photo.canvas.width, vh = photo.canvas.height;
-  const fit = Math.min(1, vw / cw, vh / ch);
-  cw *= fit; ch *= fit;
-  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2 - fh * 0.04;
-  return {
-    x: Math.max(0, Math.min(vw - cw, cx - cw / 2)),
-    y: Math.max(0, Math.min(vh - ch, cy - ch / 2)),
-    w: cw, h: ch,
-  };
+function goTo(index, now) {
+  stepIndex = index;
+  stepStart = now;
+  goodSince = null;
+  if (stepIndex >= steps.length) { stopExperience(); return; }
+  $("controls").classList.toggle("hidden", steps[stepIndex].type !== "live");
 }
-
-// Draws the face from `src` into the box, mirrored like a selfie.
-// Optionally draws a yellow circle around `ring` (photo coordinates).
-function drawFace(src, x, y, w, h, ring, t) {
-  const crop = cropFor(w / h);
-  ctx.save();
-  ctx.beginPath();
-  roundRectPath(x, y, w, h, Math.min(w, h) * 0.04);
-  ctx.clip();
-  ctx.translate(x + w, y);
-  ctx.scale(-1, 1);
-  ctx.drawImage(src, crop.x, crop.y, crop.w, crop.h, 0, 0, w, h);
-  if (ring) {
-    const sc = w / crop.w;
-    const rx = (ring.x - crop.x) * sc, ry = (ring.y - crop.y) * sc, rr = ring.r * sc;
-    const pulse = 1 + 0.06 * Math.sin(t * 4);
-    ctx.strokeStyle = "rgba(255,212,121,0.95)";
-    ctx.lineWidth = Math.max(3, w * 0.008);
-    ctx.setLineDash([w * 0.025, w * 0.015]);
-    ctx.beginPath();
-    ctx.arc(rx, ry, rr * pulse, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.setLineDash([]);
-  }
-  ctx.restore();
-}
-
-// Renders the photo with the given symptom strengths into frameCanvas
-function renderPhoto(w, t) {
-  lm = photo.landmarks;
-  const fx = buildEffects(w);
-  renderWarp(photo.canvas, fx);
-  drawOverlays(frameCtx, w, fx.blobs, t);
-}
+const nextStep = (now) => goTo(stepIndex + 1, now);
 
 // ---------------------------------------------------------------------------
-// Drawing helpers
+// Drawing helpers (2D canvas on screen)
 // ---------------------------------------------------------------------------
 const FONT = `system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
 
@@ -561,14 +699,12 @@ function background(w, h) {
   ctx.fillRect(0, 0, w, h);
 }
 
-function text(str, x, y, size, color = "#fff", weight = 700, alpha = 1, maxW) {
+function text(str, x, y, size, color = "#fff", weight = 700, alpha = 1, maxW = canvas.width * 0.92) {
   ctx.globalAlpha = alpha;
   ctx.fillStyle = color;
   ctx.font = `${weight} ${size}px ${FONT}`;
-  if (maxW && ctx.measureText(str).width > maxW) {
-    size *= maxW / ctx.measureText(str).width;
-    ctx.font = `${weight} ${size}px ${FONT}`;
-  }
+  const tw = ctx.measureText(str).width;
+  if (tw > maxW) ctx.font = `${weight} ${size * maxW / tw}px ${FONT}`;
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   ctx.fillText(str, x, y);
@@ -584,63 +720,75 @@ function roundRectPath(x, y, w, h, r) {
   ctx.closePath();
 }
 
-function pill(str, cx, cy, size, color) {
+function pill(str, cx, cy, size, color = "#fff") {
   ctx.font = `700 ${size}px ${FONT}`;
   const maxW = canvas.width * 0.86;
-  if (ctx.measureText(str).width > maxW) {
-    size *= maxW / ctx.measureText(str).width;
-    ctx.font = `700 ${size}px ${FONT}`;
-  }
+  if (ctx.measureText(str).width > maxW) { size *= maxW / ctx.measureText(str).width; ctx.font = `700 ${size}px ${FONT}`; }
   const tw = ctx.measureText(str).width;
   ctx.fillStyle = "rgba(0,0,0,0.6)";
   ctx.beginPath();
-  roundRectPath(cx - tw / 2 - size * 0.6, cy - size * 0.8, tw + size * 1.2, size * 1.6, size * 0.8);
+  roundRectPath(cx - tw / 2 - size * 0.7, cy - size * 0.85, tw + size * 1.4, size * 1.7, size * 0.85);
   ctx.fill();
   text(str, cx, cy, size, color, 700);
 }
 
-// Two face pictures: on top of each other (portrait) or side by side (landscape)
-function drawPair(w, h, top, bottom, labelA, labelB, drawA, drawB) {
-  const u = Math.min(w, h);
-  const gap = u * 0.03;
-  const areaH = bottom - top;
-  let boxes;
-  if (h >= w) {
-    const ph = (areaH - gap) / 2, pw = Math.min(w * 0.94, ph * 1.15);
-    const x = (w - pw) / 2;
-    boxes = [[x, top, pw, ph], [x, top + ph + gap, pw, ph]];
-  } else {
-    let pw = (w * 0.94 - gap) / 2, ph = Math.min(areaH, pw * 1.25);
-    pw = Math.min(pw, ph / 0.8);
-    const y = top + (areaH - ph) / 2;
-    boxes = [[w / 2 - gap / 2 - pw, y, pw, ph], [w / 2 + gap / 2, y, pw, ph]];
+// Video/canvas drawn to fill the box, mirrored like a selfie.
+// Returns a function that maps image pixels to screen pixels.
+function drawCover(src, sw, sh, x, y, w, h) {
+  const sc = Math.max(w / sw, h / sh);
+  const ox = (w - sw * sc) / 2, oy = (h - sh * sc) / 2;
+  ctx.save();
+  ctx.beginPath(); ctx.rect(x, y, w, h); ctx.clip();
+  ctx.translate(x + w, y); ctx.scale(-1, 1);
+  ctx.drawImage(src, ox, oy, sw * sc, sh * sc);
+  ctx.restore();
+  return (p) => ({ x: x + w - (ox + p.x * sc), y: y + oy + p.y * sc });
+}
+
+// Part of the photo around the face with the given shape
+function faceCrop(lm, aspect, W, H) {
+  let minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
+  for (let i = 0; i < 468; i++) {
+    const p = lm[i];
+    minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
+    minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y);
   }
-  const labelSize = u * 0.04;
-  [[drawA, labelA, "#fff"], [drawB, labelB, "#ffd479"]].forEach(([draw, label, color], i) => {
-    const [x, y, pw, ph] = boxes[i];
-    draw(x, y, pw, ph);
-    ctx.strokeStyle = i ? "rgba(255,212,121,0.9)" : "rgba(255,255,255,0.7)";
-    ctx.lineWidth = Math.max(2, u * 0.005);
+  const fw = maxX - minX, fh = maxY - minY;
+  let ch = fh / 0.78, cw = ch * aspect;
+  if (cw < fw / 0.8) { cw = fw / 0.8; ch = cw / aspect; }
+  const fit = Math.min(1, W / cw, H / ch);
+  cw *= fit; ch *= fit;
+  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2 - fh * 0.04;
+  return { x: Math.max(0, Math.min(W - cw, cx - cw / 2)), y: Math.max(0, Math.min(H - ch, cy - ch / 2)), w: cw, h: ch };
+}
+
+// Draws the face (cropped from glCanvas or the photo) into a box, mirrored
+function drawFaceBox(src, x, y, w, h, ring, t) {
+  const crop = faceCrop(photo.lm, w / h, photo.canvas.width, photo.canvas.height);
+  ctx.save();
+  ctx.beginPath(); roundRectPath(x, y, w, h, Math.min(w, h) * 0.04); ctx.clip();
+  ctx.translate(x + w, y); ctx.scale(-1, 1);
+  ctx.drawImage(src, crop.x, crop.y, crop.w, crop.h, 0, 0, w, h);
+  if (ring && ring.a > 0.01) { // yellow circle: "look here"
+    const sc = w / crop.w;
+    ctx.strokeStyle = `rgba(255,212,121,${0.95 * ring.a})`;
+    ctx.lineWidth = Math.max(3, w * 0.008);
+    ctx.setLineDash([w * 0.025, w * 0.015]);
     ctx.beginPath();
-    roundRectPath(x, y, pw, ph, Math.min(pw, ph) * 0.04);
+    ctx.arc((ring.x - crop.x) * sc, (ring.y - crop.y) * sc, ring.r * sc * (1 + 0.05 * Math.sin(t * 4)), 0, Math.PI * 2);
     ctx.stroke();
-    pill(label, x + pw / 2, y + ph - labelSize * 1.3, labelSize, color);
-  });
+    ctx.setLineDash([]);
+  }
+  ctx.restore();
+  ctx.strokeStyle = "rgba(255,255,255,0.6)";
+  ctx.lineWidth = Math.max(2, Math.min(w, h) * 0.005);
+  ctx.beginPath(); roundRectPath(x, y, w, h, Math.min(w, h) * 0.04); ctx.stroke();
 }
 
-function header(w, h, small, big) {
-  const u = Math.min(w, h);
-  text(small, w / 2, h * 0.035, u * 0.035, "#9fc3ff", 600);
-  text(big, w / 2, h * 0.035 + u * 0.075, u * 0.07, "#ffd479", 800, 1, w * 0.92);
-  return h * 0.035 + u * 0.13;
-}
-
-function progressBar(w, h, progress) {
-  const u = Math.min(w, h);
-  ctx.fillStyle = "rgba(255,255,255,0.2)";
-  ctx.fillRect(w * 0.1, h - u * 0.03, w * 0.8, u * 0.008);
-  ctx.fillStyle = "#ffd479";
-  ctx.fillRect(w * 0.1, h - u * 0.03, w * 0.8 * Math.min(1, progress), u * 0.008);
+function ringFor(key, lm) {
+  const S = aff(), eyeD = dist(lm[S.eyeOuter], lm[hea().eyeOuter]);
+  const at = (i, r) => ({ x: lm[i].x, y: lm[i].y, r: r * eyeD });
+  return { brow: at(S.browMid, 0.3), eye: at(S.lowerLid, 0.22), cheek: at(S.fold, 0.32), mouth: at(S.mouthCorner, 0.28) }[key];
 }
 
 // ---------------------------------------------------------------------------
@@ -666,41 +814,45 @@ function loop(now) {
   const w = canvas.width, h = canvas.height, u = Math.min(w, h);
   ctx.fillStyle = "#000";
   ctx.fillRect(0, 0, w, h);
+  const captionH = 34 * Math.min(window.devicePixelRatio || 1, 2);
 
   if (step.type === "countdown") {
     background(w, h);
-    const n = Math.max(1, Math.ceil(step.dur - local));
-    const f = local % 1;
+    const n = Math.max(1, Math.ceil(step.dur - local)), f = local % 1;
     text(String(n), w / 2, h / 2, u * 0.35 * (1 + (1 - f) * 0.3), "#fff", 800, 1 - f * 0.6);
   } else if (step.type === "title") {
     background(w, h);
     const a = ease(local / 0.8) * ease((step.dur - local) / 0.6);
-    text("Facial Nerve Palsy", w / 2, h * 0.46, u * 0.1, "#fff", 800, a, w * 0.9);
+    text("Facial Nerve Palsy", w / 2, h * 0.46, u * 0.1, "#fff", 800, a);
     text("Bell's palsy", w / 2, h * 0.46 + u * 0.1, u * 0.05, "#ffd479", 500, a);
+  } else if (step.type === "live") {
+    drawLive(now, local, w, h, u);
   } else if (step.type === "photo") {
-    drawPhotoStep(now, local, step, w, h, u);
+    drawPhotoStep(now, local, w, h, u);
   } else if (step.type === "symptom") {
+    // one photo; the symptom fades in, stays, and fades out again
     const sym = SYMPTOMS[step.index];
-    const weights = { ...NONE };
-    weights[sym.key] = ease((local - 0.6) / 1.5); // the change appears smoothly
-    if (sym.key === "eye") weights.close = blinkCycle(local);
-    renderPhoto(weights, local);
-    const ring = local > 1 ? highlightFor(sym.key) : null;
+    const amt = ease(local / 0.7) * ease((step.dur - local) / 0.7);
+    const wts = { brow: 0, eye: 0, cheek: 0, mouth: 0 };
+    wts[sym.key] = amt;
+    renderFace(photo.canvas, photo.lm, wts, photo.neutralLm);
     background(w, h);
-    const top = header(w, h, `Symptom ${step.index + 1} of ${SYMPTOMS.length}`, sym.title);
-    drawPair(w, h, top, h - u * 0.06, "Your face", "Bell's palsy",
-      (x, y, pw, ph) => drawFace(photo.canvas, x, y, pw, ph),
-      (x, y, pw, ph) => drawFace(frameCanvas, x, y, pw, ph, ring, local));
-    progressBar(w, h, local / step.dur);
-    flash(local, w, h);
+    text(`Symptom ${step.index + 1} of ${SYMPTOMS.length}`, w / 2, h * 0.04, u * 0.035, "#9fc3ff", 600);
+    text(sym.title, w / 2, h * 0.04 + u * 0.07, u * 0.065, "#ffd479", 800);
+    const top = h * 0.04 + u * 0.13, bottom = h - captionH - u * 0.03;
+    const bh = bottom - top, bw = Math.min(w * 0.94, bh * 0.82);
+    drawFaceBox(glCanvas, (w - bw) / 2, top, bw, bh, { ...ringFor(sym.key, photo.lm), a: amt }, local);
+    if (stepIndex === steps.findIndex((s) => s.type === "symptom")) flash(local, w, h);
   } else if (step.type === "final") {
-    renderPhoto(ALL, local + 2);
+    renderFace(photo.canvas, photo.lm, ALL, photo.neutralLm);
     background(w, h);
-    const top = header(w, h, "Bell's palsy", "All symptoms together");
-    drawPair(w, h, top, h - u * 0.03, "Normal face", "Bell's palsy face",
-      (x, y, pw, ph) => drawFace(photo.canvas, x, y, pw, ph),
-      (x, y, pw, ph) => drawFace(frameCanvas, x, y, pw, ph));
-    flash(local, w, h);
+    text("All symptoms together", w / 2, h * 0.05, u * 0.06, "#ffd479", 800);
+    const top = h * 0.05 + u * 0.07, bottom = h - captionH - u * 0.02, gap = u * 0.025;
+    const ph = (bottom - top - gap) / 2, pw = Math.min(w * 0.94, ph * 1.15), x = (w - pw) / 2;
+    drawFaceBox(photo.canvas, x, top, pw, ph);
+    pill("Normal face", w / 2, top + ph - u * 0.05, u * 0.04);
+    drawFaceBox(glCanvas, x, top + ph + gap, pw, ph);
+    pill("Bell's palsy face", w / 2, top + 2 * ph + gap - u * 0.05, u * 0.04, "#ffd479");
   } else if (step.type === "thanks") {
     background(w, h);
     const a = ease(local);
@@ -709,122 +861,117 @@ function loop(now) {
   }
 }
 
-// "Try to close both eyes": the healthy eye closes every 3 seconds for 1.5 s
-function blinkCycle(t) {
-  if (t < 1.5) return 0;
-  const p = (t - 1.5) % 3;
-  return ease(p / 0.3) * ease((1.8 - p) / 0.3);
+// Live palsy mirror with prompts and controls
+function drawLive(now, local, w, h, u) {
+  if (video.readyState < 2) return;
+  const has = faceVisible(now);
+  const lm = has ? live.lm : null;
+  if (showOriginal || !lm) renderFace(video, null, ALL, null);
+  else renderFace(video, lm, ALL, neutralOn(lm), live.eyeClose || 0);
+  drawCover(glCanvas, glCanvas.width, glCanvas.height, 0, 0, w, h);
+  const i = Math.min(PROMPTS.length - 1, Math.floor(local / CONFIG.promptSeconds));
+  pill(has ? PROMPTS[i] : "Look at the camera", w / 2, h * 0.07, u * 0.055, "#ffd479");
+  if (showOriginal) pill("Original", w / 2, h * 0.07 + u * 0.1, u * 0.035);
 }
 
-// White camera flash right after a photo
 function flash(local, w, h) {
   if (local > 0.5) return;
   ctx.fillStyle = `rgba(255,255,255,${1 - local / 0.5})`;
   ctx.fillRect(0, 0, w, h);
 }
 
-// Checks if the face is well placed for a photo. Returns null if good, or a message.
+// Checks the face position for the photo. Returns null if good, else a message.
 function checkPosition(now, oval, map) {
   if (!faceVisible(now)) return "Stand in front of the tablet";
   const L = live.lm;
   const top = map(L[10]), chin = map(L[152]);
-  const faceH = Math.hypot(chin.x - top.x, chin.y - top.y);
+  const faceH = dist(top, chin);
   const cx = (top.x + chin.x) / 2, cy = (top.y + chin.y) / 2;
   if (faceH < oval.ry * 1.2) return "Come a little closer";
   if (faceH > oval.ry * 1.95) return "Move back a little";
-  // forehead-to-chin centre sits a bit below the oval centre (the oval also holds the hair)
   if (Math.abs(cx - oval.x) > oval.rx * 0.28 || Math.abs(cy - (oval.y + oval.ry * 0.1)) > oval.ry * 0.3)
     return "Move your face into the oval";
-  const e1 = L[33], e2 = L[263];
-  const roll = Math.abs(Math.atan2(e2.y - e1.y, e2.x - e1.x)) * 180 / Math.PI;
+  const roll = Math.abs(Math.atan2(L[263].y - L[33].y, L[263].x - L[33].x)) * 180 / Math.PI;
   if (Math.min(roll, 180 - roll) > 8) return "Keep your head straight";
   if (live.turn > 14) return "Look straight at the camera";
-  if (live.blink > 0.5) return "Keep your eyes open";
+  if (live.blend.blink > 0.5) return "Keep your eyes open";
   if (live.speed > 0.25) return "Keep still";
   return null;
 }
 
-// Live camera with face-position check; the photo is taken when the face
-// has been in a good position for photoHoldSeconds.
-function drawPhotoStep(now, local, step, w, h, u) {
-  let map = (p) => p;
-  if (video.readyState >= 2) {
-    const vw = video.videoWidth, vh = video.videoHeight;
-    const sc = Math.max(w / vw, h / vh);
-    const ox = (w - vw * sc) / 2, oy = (h - vh * sc) / 2;
-    ctx.save();
-    ctx.translate(w, 0);
-    ctx.scale(-1, 1); // mirror, like a selfie
-    ctx.drawImage(video, ox, oy, vw * sc, vh * sc);
-    ctx.restore();
-    map = (p) => ({ x: w - (ox + p.x * sc), y: oy + p.y * sc });
-  }
-
-  const oval = { x: w / 2, y: h * 0.46 };
+// Live camera (original) with an oval; the photo is taken once the face has
+// been in a good position for photoHoldSeconds.
+function drawPhotoStep(now, local, w, h, u) {
+  if (video.readyState < 2) return;
+  const map = drawCover(video, video.videoWidth, video.videoHeight, 0, 0, w, h);
+  const oval = { x: w / 2, y: h * 0.45 };
   oval.ry = Math.min(h * 0.27, w * 0.45);
   oval.rx = oval.ry * 0.76;
 
-  if (DEBUG && faceVisible(now)) { // show tracked points
-    ctx.fillStyle = "#0f0";
-    for (const p of live.lm) { const q = map(p); ctx.fillRect(q.x - 1, q.y - 1, 3, 3); }
-  }
   const problem = checkPosition(now, oval, map);
   lastProblem = problem;
   const ready = local >= CONFIG.photoGetReadySeconds;
   if (problem || !ready) goodSince = null;
   else if (goodSince === null) goodSince = now;
-  const held = goodSince === null ? 0 : (now - goodSince) / 1000;
 
-  // darken outside the oval
-  ctx.save();
+  ctx.save(); // darken around the oval
   ctx.fillStyle = "rgba(0,0,0,0.45)";
-  ctx.beginPath();
-  ctx.rect(0, 0, w, h);
+  ctx.beginPath(); ctx.rect(0, 0, w, h);
   ctx.moveTo(oval.x + oval.rx, oval.y);
   ctx.ellipse(oval.x, oval.y, oval.rx, oval.ry, 0, 0, Math.PI * 2);
   ctx.fill("evenodd");
   ctx.restore();
-
-  const good = !problem;
-  ctx.strokeStyle = good ? "#3ddc84" : "#ff6b6b";
+  ctx.strokeStyle = problem ? "#ff6b6b" : "#3ddc84";
   ctx.lineWidth = u * 0.008;
-  ctx.setLineDash(good ? [] : [u * 0.025, u * 0.018]);
-  ctx.beginPath();
-  ctx.ellipse(oval.x, oval.y, oval.rx, oval.ry, 0, 0, Math.PI * 2);
-  ctx.stroke();
+  ctx.setLineDash(problem ? [u * 0.025, u * 0.018] : []);
+  ctx.beginPath(); ctx.ellipse(oval.x, oval.y, oval.rx, oval.ry, 0, 0, Math.PI * 2); ctx.stroke();
   ctx.setLineDash([]);
 
-  text(step.label, w / 2, h * 0.04, u * 0.035, "#9fc3ff", 600);
-  const msg = !ready ? (problem || "Get ready… look at the camera and smile")
-            : problem || "Perfect! Smile and hold still";
-  pill(msg, w / 2, oval.y + oval.ry + u * 0.08, u * 0.05, good ? "#3ddc84" : "#ffffff");
+  text("Photo", w / 2, h * 0.04, u * 0.04, "#9fc3ff", 600);
+  pill(problem || (ready ? "Perfect! Smile and hold still" : "Get ready… look at the camera and smile"),
+       w / 2, oval.y + oval.ry + u * 0.08, u * 0.05, problem ? "#fff" : "#3ddc84");
 
   if (goodSince !== null) {
-    const left = CONFIG.photoHoldSeconds - held;
-    if (left > 0) {
-      text(String(Math.ceil(left)), w / 2, oval.y + oval.ry + u * 0.22, u * 0.14, "#ffd479", 800, 0.95);
-    } else {
-      takePhoto();
-      nextStep(now);
-    }
-  } else if (!ready) {
-    text("Get ready for the photo", w / 2, h * 0.04 + u * 0.06, u * 0.05, "#fff", 700);
+    const left = CONFIG.photoHoldSeconds - (now - goodSince) / 1000;
+    if (left > 0) text(String(Math.ceil(left)), w / 2, oval.y + oval.ry + u * 0.22, u * 0.14, "#ffd479", 800);
+    else { takePhoto(); nextStep(now); }
   }
 }
+
+function takePhoto() {
+  const c = document.createElement("canvas");
+  c.width = video.videoWidth; c.height = video.videoHeight;
+  c.getContext("2d").drawImage(video, 0, 0);
+  const lm = live.lm.map((p) => ({ ...p }));
+  photo = { canvas: c, lm, neutralLm: neutralOn(lm) };
+}
+
+// ---------------------------------------------------------------------------
+// Controls
+// ---------------------------------------------------------------------------
+function updateControls() {
+  $("sideLeft").classList.toggle("on", sideName === "left");
+  $("sideRight").classList.toggle("on", sideName === "right");
+  $("severity").value = grade;
+  $("sevLabel").textContent = "House-Brackmann grade " + GRADES[grade].name;
+  $("original").classList.toggle("on", showOriginal);
+  $("original").textContent = showOriginal ? "Show palsy" : "Show original";
+}
+$("sideLeft").onclick = () => { sideName = "left"; eyeRef = null; updateControls(); };
+$("sideRight").onclick = () => { sideName = "right"; eyeRef = null; updateControls(); };
+$("severity").oninput = (e) => { grade = +e.target.value; updateControls(); };
+$("original").onclick = () => { showOriginal = !showOriginal; updateControls(); };
+$("photoBtn").onclick = () => { if (running) goTo(steps.findIndex((s) => s.type === "photo"), performance.now()); };
+updateControls();
 
 // ---------------------------------------------------------------------------
 // Start / stop
 // ---------------------------------------------------------------------------
 async function startExperience() {
-  affected = SIDE[document.getElementById("side").value];
-  healthy = affected === SIDE.left ? SIDE.right : SIDE.left;
-  strength = parseFloat(document.getElementById("strength").value);
-
   try { await document.documentElement.requestFullscreen?.(); } catch (e) {}
   try { await screen.orientation?.lock?.("portrait"); } catch (e) {}
   try { wakeLock = await navigator.wakeLock?.request("screen"); } catch (e) {}
-
-  statusEl.textContent = "Starting camera…";
+  $("status").textContent = "Starting camera…";
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       audio: false,
@@ -832,36 +979,36 @@ async function startExperience() {
     });
   } catch (e) {
     console.error(e);
-    statusEl.textContent = "Camera not available. Please allow camera access and try again.";
+    $("status").textContent = "Camera not available. Please allow camera access and try again.";
     return;
   }
   video.srcObject = stream;
   try { await video.play(); } catch (e) {}
-
-  live = null; photo = null; goodSince = null;
+  live = null; neutral = null; eyeRef = null; photo = null; triangles = null; showOriginal = false;
+  updateControls();
   steps = buildSteps();
-  stepIndex = 0;
-  menu.classList.add("hidden");
+  $("menu").classList.add("hidden");
   running = true;
   resize();
-  stepStart = performance.now();
+  goTo(0, performance.now());
   requestAnimationFrame(loop);
 }
 
 function stopExperience() {
   running = false;
-  if (stream) { stream.getTracks().forEach((tr) => tr.stop()); stream = null; }
+  if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
   try { wakeLock?.release(); } catch (e) {}
   wakeLock = null;
+  $("controls").classList.add("hidden");
   ctx.fillStyle = "#000";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
-  menu.classList.remove("hidden");
-  statusEl.textContent = "Ready for the next visitor. Tap Start.";
+  $("menu").classList.remove("hidden");
+  $("status").textContent = "Ready for the next visitor. Tap Start.";
 }
 
-btnStart.addEventListener("click", startExperience);
+$("start").addEventListener("click", startExperience);
 
-// Double-tap (or double-click) to go back to the start screen
+// Double-tap the picture to go back to the start screen
 let lastTap = 0;
 canvas.addEventListener("pointerdown", () => {
   const now = performance.now();
@@ -869,22 +1016,33 @@ canvas.addEventListener("pointerdown", () => {
   lastTap = now;
 });
 
-// Debug hook used for automated testing
+// Hook used for automated testing
 window.__palsy = {
-  CONFIG,
   get step() { return running ? steps[stepIndex].type : "menu"; },
   get index() { return stepIndex; },
-  // test helper: changed face for the given symptom strengths, as an image
-  render(weights) {
-    if (!live) return null;
+  get problem() { return lastProblem; },
+  get live() { return live && { turn: live.turn, blend: live.blend, tris: triangles && triangles.length / 3 }; },
+  setGrade(g) { grade = g; updateControls(); },
+  // test only: pretend the relaxed face has the mouth corners lower and narrower
+  fakeNeutral() {
+    const lm = live.lm, e = dist(lm[33], lm[263]);
+    neutral = { lm: lm.map((p) => ({ ...p })) };
+    for (const c of [61, 291]) {
+      const C = lm[c], dir = c === 61 ? 1 : -1;
+      neutral.lm.forEach((q, i) => {
+        const f = Math.exp(-(dist(lm[i], C) ** 2) / (2 * (0.2 * e) ** 2));
+        q.x += dir * 0.06 * e * f; q.y += 0.07 * e * f;
+      });
+    }
+  },
+  // render the current camera frame as a photo with the given symptoms → PNG
+  render(w) {
     takePhoto();
-    renderPhoto({ ...NONE, ...weights }, 2.2);
+    renderFace(photo.canvas, photo.lm, { brow: 0, eye: 0, cheek: 0, mouth: 0, ...w }, photo.neutralLm);
     const c = document.createElement("canvas");
     c.width = 500; c.height = 600;
-    const crop = cropFor(500 / 600);
-    c.getContext("2d").drawImage(frameCanvas, crop.x, crop.y, crop.w, crop.h, 0, 0, 500, 600);
+    const crop = faceCrop(photo.lm, 500 / 600, photo.canvas.width, photo.canvas.height);
+    c.getContext("2d").drawImage(glCanvas, crop.x, crop.y, crop.w, crop.h, 0, 0, 500, 600);
     return c.toDataURL("image/png");
   },
-  get problem() { return lastProblem; },
-  get live() { return live && { turn: live.turn, blink: live.blink, speed: live.speed }; },
 };
